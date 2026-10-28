@@ -38,12 +38,23 @@ data class FetchedEndpoints(
  * The file may 404 until the first publish — callers treat failure as
  * "keep cache / bundled", never as fatal.
  *
- * The fetch is bound to the underlying physical network (cellular / Wi-Fi),
- * never routed through the VPN tunnel: plain internet is enough to receive
- * new endpoints — no working tunnel and no handshake are required, so a
- * dead/blackholed tunnel can never strangle the refresh.
+ * Relay-first (user spec 2026-10-28, no-VPN on all networks): the
+ * Lovable relay is tried before GitHub raw, because the relay is
+ * reachable on networks where GitHub is not (home WiFi) and where
+ * Firebase is not (MPT data, home WiFi). Raw stays as the fallback
+ * for when the relay itself is down. The relay serves the same file
+ * byte-identical (verified 2026-10-28), so callers see no difference.
+ *
+ * Each URL is fetched bound to the underlying physical network
+ * (cellular / Wi-Fi), never routed through the VPN tunnel: plain
+ * internet is enough to receive new endpoints — no working tunnel
+ * and no handshake are required, so a dead/blackholed tunnel can
+ * never strangle the refresh.
  */
 object EndpointService {
+    /** Lovable feed relay (proven live 2026-10-28, no-VPN everywhere). */
+    const val RELAY_URL = "https://ipmh.lovable.app/api/test-relay"
+
     const val URL = "https://raw.githubusercontent.com/tugyix05/Warp-IP-Scanner/main/endpoints.json"
 
     private val httpClient = OkHttpClient.Builder()
@@ -55,31 +66,38 @@ object EndpointService {
 
     suspend fun fetch(context: Context): Result<FetchedEndpoints> =
         withContext(Dispatchers.IO) {
-            val net = underlyingNetwork(context)
-            if (net != null) {
-                val bound = try {
-                    httpClient.newBuilder()
-                        .socketFactory(net.socketFactory)
-                        .dns(object : Dns {
-                            override fun lookup(hostname: String): List<InetAddress> =
-                                net.getAllByName(hostname).toList()
-                        })
-                        .build()
-                } catch (_: Exception) {
-                    null
-                }
-                if (bound != null) {
-                    val r = attempt(bound)
-                    if (r.isSuccess) return@withContext r
-                }
-            }
-            attempt(httpClient)
+            val relay = attemptUrl(context, RELAY_URL)
+            if (relay.isSuccess) return@withContext relay
+            attemptUrl(context, URL)
         }
 
-    private fun attempt(client: OkHttpClient): Result<FetchedEndpoints> {
+    /** One URL, bound to the underlying network first, then unbound. */
+    private fun attemptUrl(context: Context, url: String): Result<FetchedEndpoints> {
+        val net = underlyingNetwork(context)
+        if (net != null) {
+            val bound = try {
+                httpClient.newBuilder()
+                    .socketFactory(net.socketFactory)
+                    .dns(object : Dns {
+                        override fun lookup(hostname: String): List<InetAddress> =
+                            net.getAllByName(hostname).toList()
+                    })
+                    .build()
+            } catch (_: Exception) {
+                null
+            }
+            if (bound != null) {
+                val r = attempt(bound, url)
+                if (r.isSuccess) return r
+            }
+        }
+        return attempt(httpClient, url)
+    }
+
+    private fun attempt(client: OkHttpClient, url: String): Result<FetchedEndpoints> {
         return try {
             val request = Request.Builder()
-                .url(URL)
+                .url(url)
                 .header("User-Agent", "PhoenixVPN/1.0 (Android)")
                 .header("Cache-Control", "no-cache")
                 .get()

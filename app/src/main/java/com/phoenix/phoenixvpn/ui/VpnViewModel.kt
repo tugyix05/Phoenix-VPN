@@ -16,7 +16,6 @@ import com.phoenix.phoenixvpn.analytics.Analytics
 import com.phoenix.phoenixvpn.network.ConfigService
 import com.phoenix.phoenixvpn.network.EndpointInfo
 import com.phoenix.phoenixvpn.network.EndpointService
-import com.phoenix.phoenixvpn.network.FeedSignalListener
 import com.phoenix.phoenixvpn.network.UpdateService
 import java.io.File
 import com.phoenix.phoenixvpn.vpn.EndpointStore
@@ -303,12 +302,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private var connectJob: Job? = null
     private var tickerJob: Job? = null
 
-    /** Firebase signal listener (null until started in init). */
-    private var feedSignalListener: FeedSignalListener? = null
-
-    /** "v" stamp of the last signal that produced a successful fetch. */
-    private var lastSignalValue: Long? = null
-
     /**
      * Endpoint id the LIVE tunnel is actually on. This differs from
      * the selected endpoint after an auto-select while connected
@@ -396,12 +389,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Feed watch: Firebase signal (Scanner publish) + on-open fetch.
-        // No 6-hour gate anymore (user spec 2026-10-28): a new feed is
-        // picked up the moment it arrives, never on a timer.
+        // Feed poll: Lovable relay first, GitHub raw fallback (user spec
+        // 2026-10-28, no-VPN on all networks). No 6-hour gate: a new feed
+        // is picked up on open and every 5 minutes while open, never on
+        // a timer. The Firebase signal listener is gone — the relay is
+        // reachable on networks where Firebase is not (MPT data, home
+        // WiFi), so polling the feed itself replaces the signal.
         viewModelScope.launch {
             delay(4000)
-            startFeedWatch()
+            startFeedPoll()
         }
 
         // Pre-fetch the WireGuard .conf on app start if missing, so the
@@ -1312,37 +1308,28 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ============================================================
-    //  Feed watch (Firebase signal, user spec 2026-10-28)
+    //  Feed poll (Lovable relay, user spec 2026-10-28)
     // ============================================================
 
     /**
-     * Starts the feed signal listener. Its first fire IS the on-open
-     * fetch (listener fires immediately with the current value), so a
-     * fresh install gets the feed at once, with no time gate at all.
-     * If no signal channel exists yet (RTDB URL not set), falls back
-     * to a single on-open fetch so the feed still arrives.
+     * Polls the feed: an immediate fetch on start (the on-open fetch),
+     * then every 5 minutes while this ViewModel lives (viewModelScope
+     * cancels the loop on clear). A new feed is applied by
+     * fetchAndApplyFeed (auto-select #1, tunnel untouched). Polling
+     * replaces the Firebase signal listener: the relay is reachable
+     * on networks where Firebase is not, so the feed itself is the
+     * change signal — no separate signal channel is needed. A
+     * publish reaches an open Phoenix within ~5 minutes (plus the
+     * raw CDN cache lag behind the relay), which is fast enough
+     * for endpoint distribution.
      */
-    private fun startFeedWatch() {
-        val listener = FeedSignalListener { v ->
-            viewModelScope.launch { onFeedSignal(v) }
-        }
-        feedSignalListener = listener
-        if (!listener.start()) {
-            viewModelScope.launch { fetchAndApplyFeed() }
-        }
-    }
-
-    /**
-     * One signal fire = one fetch, deduplicated by the signal value:
-     * a reconnect re-fire carries the SAME "v" and is skipped, while
-     * a genuinely new publish (new "v") always fetches, even within
-     * the same minute. A failed fetch does not consume the guard, so
-     * a retry on the next fire still works.
-     */
-    private suspend fun onFeedSignal(v: Long?) {
-        if (v != null && v == lastSignalValue) return
-        if (fetchAndApplyFeed()) {
-            lastSignalValue = v
+    private fun startFeedPoll() {
+        viewModelScope.launch {
+            fetchAndApplyFeed()
+            while (true) {
+                delay(5 * 60 * 1000L)
+                fetchAndApplyFeed()
+            }
         }
     }
 
@@ -1362,7 +1349,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      * nothing but the stored list.
      */
     private suspend fun fetchAndApplyFeed(): Boolean {
-        if (!hasValidatedInternet()) return false
+        // No validated-internet gate (deliberate, 2026-10-28): the relay
+        // is reachable on networks Android marks unvalidated (home WiFi
+        // blocks Google but not Lovable), and a failed fetch already
+        // returns false — silently on the auto path, visibly on Refresh.
         val res = try {
             EndpointService.fetch(app)
         } catch (_: Exception) {
