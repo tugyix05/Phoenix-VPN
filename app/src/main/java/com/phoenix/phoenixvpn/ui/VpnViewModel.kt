@@ -16,6 +16,7 @@ import com.phoenix.phoenixvpn.analytics.Analytics
 import com.phoenix.phoenixvpn.network.ConfigService
 import com.phoenix.phoenixvpn.network.EndpointInfo
 import com.phoenix.phoenixvpn.network.EndpointService
+import com.phoenix.phoenixvpn.network.FeedSignalListener
 import com.phoenix.phoenixvpn.network.UpdateService
 import java.io.File
 import com.phoenix.phoenixvpn.vpn.EndpointStore
@@ -301,7 +302,21 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private var connectJob: Job? = null
     private var tickerJob: Job? = null
-    private var lastBackgroundFetchAt: Long = 0L
+
+    /** Firebase signal listener (null until started in init). */
+    private var feedSignalListener: FeedSignalListener? = null
+
+    /** "v" stamp of the last signal that produced a successful fetch. */
+    private var lastSignalValue: Long? = null
+
+    /**
+     * Endpoint id the LIVE tunnel is actually on. This differs from
+     * the selected endpoint after an auto-select while connected
+     * (selection moves to new #1, tunnel stays on the old endpoint),
+     * so failover must exclude THIS id — not the UI's current id —
+     * or it would wrongly skip the healthy new #1.
+     */
+    private var tunnelEndpointId: String? = null
 
     init {
         // Restore persisted state into the manager (auto-run rules need it).
@@ -381,10 +396,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // Silent background refresh of the published list.
+        // Feed watch: Firebase signal (Scanner publish) + on-open fetch.
+        // No 6-hour gate anymore (user spec 2026-10-28): a new feed is
+        // picked up the moment it arrives, never on a timer.
         viewModelScope.launch {
             delay(4000)
-            backgroundRefresh()
+            startFeedWatch()
         }
 
         // Pre-fetch the WireGuard .conf on app start if missing, so the
@@ -453,9 +470,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      *   internet → VPN permission → fetch .conf (if missing) →
      *   connect immediately on the card's top-3 (cached list, or bundled
      *   on fresh install). Endpoint freshness is handled separately: the
-     *   6-hour background check and the manual Refresh pill (update →
-     *   replace, no update → leave as-is). Tap never waits on — or
-     *   triggers — an endpoints fetch.
+     *   Firebase signal watch (new feed → #1 auto-selected, tunnel
+     *   never switched) and the manual Refresh pill (update → replace,
+     *   no update → leave as-is). Tap never waits on — or triggers —
+     *   an endpoints fetch.
      *   Then connect with failover (explicit → top-3 → last-working →
      *   rest → bundled → manual; first candidate fire-and-forget).
      * Any step may abort back to disconnected with a toast reason.
@@ -527,6 +545,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val cfg = manager.swapEndpoint(conf, endpointId)
         manager.setUserOverride(false)
         store.currentEndpoint = endpointId
+        tunnelEndpointId = endpointId
         pushDefaultTunnel(conf, endpointId)
         refreshUiRows()
         _ui.update { it.copy(currentMs = msFor(endpointId)) }
@@ -609,6 +628,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 try {
                     manager.setUserOverride(false)
                     store.currentEndpoint = e.id
+                    tunnelEndpointId = e.id
                     pushDefaultTunnel(conf, e.id)
                     refreshUiRows()
                     _ui.update { it.copy(currentMs = e.ms) }
@@ -628,6 +648,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val ok = awaitHandshakeWithReroll(manager.tunnelNameFor(e.id), cfg)
             if (ok) {
                 store.currentEndpoint = e.id
+                tunnelEndpointId = e.id
                 pushDefaultTunnel(conf, e.id)
                 refreshUiRows()
                 _ui.update { it.copy(currentMs = e.ms) }
@@ -668,7 +689,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         if (manager.isUserOverride()) return
         val st = vpnState.value.connectionState
         if (st != TunnelConnectionState.CONNECTED && st != TunnelConnectionState.CONNECTING) return
-        val cur = _ui.value.currentId
+        // Exclude the LIVE tunnel's endpoint, not the UI selection:
+        // after an auto-select while connected those differ, and
+        // excluding the selection would wrongly skip the healthy new #1.
+        val cur = tunnelEndpointId ?: _ui.value.currentId
         val conf = store.baseConf ?: return
         message(reason)
         viewModelScope.launch {
@@ -836,13 +860,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshEndpointsNow() {
         viewModelScope.launch {
             message("Refreshing endpoints…")
-            val res = EndpointService.fetch(app)
-            if (res.isSuccess) {
-                val f = res.getOrThrow()
-                store.saveFetched(f, now())
-                refreshUpdatedAgo()
+            if (fetchAndApplyFeed()) {
                 _ui.update { it.copy(liveMs = emptyMap(), measuringIds = emptySet()) }
-                refreshUiRows()
             } else {
                 message("Feed refresh failed — keeping current list")
             }
@@ -1293,38 +1312,80 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ============================================================
-    //  Background refresh
+    //  Feed watch (Firebase signal, user spec 2026-10-28)
     // ============================================================
 
-    private suspend fun CoroutineScope.backgroundRefresh() {
-        while (isActive) {
-            try {
-                val now = now()
-                if (now - lastBackgroundFetchAt > EndpointStore.CACHE_TTL_MS &&
-                    store.isCacheStale(now) && hasValidatedInternet()
-                ) {
-                    lastBackgroundFetchAt = now
-                    val res = EndpointService.fetch(app)
-                    if (res.isSuccess) {
-                        val f = res.getOrThrow()
-                        store.saveFetched(f, now())
-                        refreshUpdatedAgo()
-                        // v1.48: no degraded failover — the endpoint never
-                        // dies and is never switched on a stall; a degraded
-                        // line is woken in place by the stall wake.
-                        // NOTE: the old "new #1 available — tap to switch"
-                        // banner is intentionally gone. A live tunnel is
-                        // never disturbed and never switched: a degraded
-                        // line is woken in place by the stall wake (v1.48).
-                        // Disconnected behavior is unchanged
-                        // (no auto-connect).
-                        refreshUiRows()
-                    }
-                }
-            } catch (_: Exception) {
-            }
-            delay(60_000)
+    /**
+     * Starts the feed signal listener. Its first fire IS the on-open
+     * fetch (listener fires immediately with the current value), so a
+     * fresh install gets the feed at once, with no time gate at all.
+     * If no signal channel exists yet (RTDB URL not set), falls back
+     * to a single on-open fetch so the feed still arrives.
+     */
+    private fun startFeedWatch() {
+        val listener = FeedSignalListener { v ->
+            viewModelScope.launch { onFeedSignal(v) }
         }
+        feedSignalListener = listener
+        if (!listener.start()) {
+            viewModelScope.launch { fetchAndApplyFeed() }
+        }
+    }
+
+    /**
+     * One signal fire = one fetch, deduplicated by the signal value:
+     * a reconnect re-fire carries the SAME "v" and is skipped, while
+     * a genuinely new publish (new "v") always fetches, even within
+     * the same minute. A failed fetch does not consume the guard, so
+     * a retry on the next fire still works.
+     */
+    private suspend fun onFeedSignal(v: Long?) {
+        if (v != null && v == lastSignalValue) return
+        if (fetchAndApplyFeed()) {
+            lastSignalValue = v
+        }
+    }
+
+    /**
+     * Fetches the published list and applies it. Returns true only on
+     * a successful fetch. Silent on the auto path (same as before).
+     *
+     * New feed (different updated_at, or a different endpoint set) =
+     * stored list becomes the new list AND #1 is auto-SELECTED —
+     * even while connected, even after a manual off (user spec
+     * 2026-10-28). The live tunnel is NEVER touched here — no
+     * stop, no restart, no default-tunnel change — so the tunnel
+     * keeps running on the old endpoint and the internet is never
+     * cut (user constraint 2026-10-28 18:25). Only the stored
+     * selection + UI change. A manual tap still overrides the
+     * selection until the next new feed. An unchanged feed touches
+     * nothing but the stored list.
+     */
+    private suspend fun fetchAndApplyFeed(): Boolean {
+        if (!hasValidatedInternet()) return false
+        val res = try {
+            EndpointService.fetch(app)
+        } catch (_: Exception) {
+            return false
+        }
+        if (!res.isSuccess) return false
+        val f = res.getOrThrow()
+        val oldUpdated = store.publishedUpdatedAt
+        val oldIds = store.cachedEndpoints.map { it.id }
+        val isNew = f.updatedAt != oldUpdated ||
+            f.endpoints.map { it.id } != oldIds
+        store.saveFetched(f, now())
+        refreshUpdatedAgo()
+        // v1.48: a live tunnel is never disturbed and never switched:
+        // a degraded line is woken in place by the stall wake.
+        if (isNew) {
+            f.endpoints.firstOrNull()?.let { first ->
+                store.currentEndpoint = first.id
+                store.explicitEndpoint = null
+            }
+        }
+        refreshUiRows()
+        return true
     }
 
     // ============================================================

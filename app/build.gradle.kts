@@ -13,8 +13,8 @@ android {
         applicationId = "com.phoenix.phoenixvpn"
         minSdk = 24
         targetSdk = 36
-        versionCode = 58
-        versionName = "1.57"
+        versionCode = 59
+        versionName = "1.58"
     }
 
     signingConfigs {
@@ -76,4 +76,5 @@ dependencies {
     implementation(platform(libs.firebase.bom))
     implementation(libs.firebase.analytics)
     implementation(libs.firebase.crashlytics)
+    implementation(libs.firebase.database)
 }
