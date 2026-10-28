@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Downloaded update APKs shared with the system installer. -->
+    <!-- v1.53: kept APKs live in filesDir/updates (never cache-purged). -->
+    <files-path name="updates_files" path="updates/" />
+    <!-- Legacy: v1.52 and earlier downloaded into cacheDir/updates. -->
+    <cache-path name="updates" path="updates/" />
+</paths>

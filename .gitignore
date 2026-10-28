@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+/local.properties
+.idea/
+.DS_Store
+/build/
+/app/build/
+*.jks
+*.keystore
+captures
+.externalNativeBuild
+.cxx
+local.properties
+
+# Firebase: injected via GOOGLE_SERVICES_JSON secret in CI; never commit
+app/google-services.json

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="my">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Endpoints Sheet — Floating Card Mockup</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  .phone {
+    width: 360px;
+    background: #0B0C0E;
+    border-radius: 28px;
+    padding: 20px 16px 28px;
+    position: relative;
+  }
+  .dim {
+    position: absolute; inset: 0;
+    background: rgba(0,0,0,0.55);
+    border-radius: 28px;
+  }
+  /* Floating sheet card — all 4 corners rounded */
+  .sheet {
+    position: relative;
+    background: #101214;
+    border-radius: 24px;              /* 4 corners rounded */
+    border: 1px solid #2A2E33;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.03);
+    padding: 12px 18px 20px;
+    margin: 70px 6px 10px;           /* floats above bottom, side margins */
+  }
+  .handle {
+    width: 40px; height: 4px;
+    background: #3A3F45;
+    border-radius: 2px;
+    margin: 2px auto 16px;
+  }
+  .title { color: #fff; font-size: 19px; font-weight: 700; }
+  .sub { color: #8A9099; font-size: 12.5px; margin-top: 5px; }
+  .ep-card {
+    background: #1D2126;
+    border: 1px solid #30363D;
+    border-radius: 16px;
+    padding: 13px 14px;
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+  }
+  .ep-ip { color: #EDEFF1; font-size: 15px; font-weight: 500; flex: 1; }
+  .best {
+    background: #4fd1c5; color: #0B0C0E;
+    font-size: 10px; font-weight: 800;
+    padding: 5px 9px; border-radius: 7px;
+    margin-right: 8px; letter-spacing: 0.5px;
+  }
+  .check { color: #4ade80; font-size: 17px; margin-right: 7px; }
+  .ms { color: #9AA0A6; font-size: 13.5px; }
+  .manual {
+    color: #9AA0A6; font-size: 14px;
+    margin-top: 14px; padding: 4px 2px;
+  }
+  .manual span { color: #4fd1c5; margin-right: 8px; font-size: 17px; }
+  .note {
+    color: #6B7280; font-size: 12px; text-align: center;
+    margin-top: 18px; max-width: 360px;
+  }
+  .wrap { display: flex; flex-direction: column; align-items: center; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="phone">
+    <div class="dim"></div>
+    <div class="sheet">
+      <div class="handle"></div>
+      <div class="title">Endpoints</div>
+      <div class="sub">Auto-fetched &nbsp;·&nbsp; publisher order &nbsp;·&nbsp; updated 50m ago</div>
+
+      <div class="ep-card">
+        <div class="ep-ip">8.6.112.156:500</div>
+        <div class="best">BEST</div>
+        <div class="check">✓</div>
+        <div class="ms">146 ms</div>
+      </div>
+      <div class="ep-card">
+        <div class="ep-ip">8.6.112.37:500</div>
+        <div class="ms">146 ms</div>
+      </div>
+      <div class="ep-card">
+        <div class="ep-ip">8.6.112.132:500</div>
+        <div class="ms">141 ms</div>
+      </div>
+
+      <div class="manual"><span>+</span>Manual endpoint</div>
+    </div>
+  </div>
+  <div class="note">Mockup: Endpoints sheet as a floating card — 24dp rounded on all 4 corners, elevated, side margins.</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,78 @@
+name: Publish Release
+
+# Two-stage release, stage 2 (2026-10-26, VPN only): creates the
+# PUBLISHED GitHub Release from a build run's artifact — only after
+# VirusTotal + the Play Protect appeal are filed for that exact APK.
+# Triggered by workflow_dispatch (by Muse after the appeal step), never
+# automatically: nothing here runs on push. Caller must ensure no
+# release with this tag exists yet (the chain checks before dispatching).
+#
+# Input:
+#   build_run_id — the "Build Release APK" run whose artifact
+#     (phoenix-vpn-release) holds the APK + checksum + release-meta.txt.
+# The release tag + version come from release-meta.txt, so the published
+# APK is byte-identical to the one VirusTotal scanned and the appeal
+# cited. No rebuild happens here, ever.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: 'Build run ID whose artifact to publish'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish Release from Artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: phoenix-vpn-release
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-artifacts
+
+      - name: Read Release Meta
+        id: meta
+        run: |
+          if [ ! -f release-artifacts/release-meta.txt ]; then
+            echo "Error: release-meta.txt missing from artifact" >&2
+            exit 1
+          fi
+          TAG=$(grep '^TAG=' release-artifacts/release-meta.txt | cut -d= -f2-)
+          APP_VERSION=$(grep '^APP_VERSION=' release-artifacts/release-meta.txt | cut -d= -f2-)
+          if [ -z "$TAG" ] || [ -z "$APP_VERSION" ]; then
+            echo "Error: incomplete release-meta.txt" >&2
+            exit 1
+          fi
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "APP_VERSION=$APP_VERSION" >> $GITHUB_OUTPUT
+          echo "Publishing $TAG (app $APP_VERSION)"
+          ls -lh release-artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.TAG }}
+          name: ${{ steps.meta.outputs.TAG }}
+          body: |
+            ### ဖီးနစ် VPN — Release
+
+            Lightweight WireGuard VPN — endpoints auto-fetched & verified:
+            - **`PhoenixVPN-v${{ steps.meta.outputs.APP_VERSION }}.apk`** — universal APK (no scanner, lean)
+            - **Min SDK**: Android 7.0 (API 24)
+            - **Target SDK**: Android 16 (API 36)
+          files: |
+            release-artifacts/*.apk
+            release-artifacts/*.sha256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
