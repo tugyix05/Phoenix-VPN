@@ -1,6 +1,7 @@
 package com.phoenix.phoenixvpn.network
 
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.DnsResolver
@@ -46,11 +47,27 @@ object UpdateService {
     private const val DOWNLOAD_BASE =
         "https://github.com/tugyix05/Phoenix-VPN/releases/download"
 
+    /**
+     * v1.61: Lovable download proxy (user design 2026-10-29).
+     * The updater downloads through the EXISTING Lovable route —
+     * the same link the homepage button serves, no second link, no
+     * re-upload. The version CHECK still uses GitHub (LATEST_URL):
+     * only the download leg moves, Lovable-first with GitHub
+     * fallback, because the WiFi path to GitHub's asset host takes
+     * ~20s to start while Lovable starts immediately. The route
+     * serves the CURRENT version, so a Lovable download is accepted
+     * only when the APK's own versionName matches the expected
+     * version; otherwise it falls back to the versioned GitHub URL.
+     */
+    private const val LOVABLE_DOWNLOAD_URL =
+        "https://ipmh.lovable.app/api/public/apk/phoenix-vpn-v18"
+
     private const val TAG = "PhoenixUpdate"
 
     data class ReleaseInfo(val tag: String, val version: String) {
         val apkUrl: String get() = "$DOWNLOAD_BASE/$tag/PhoenixVPN-v$version.apk"
         val apkName: String get() = "PhoenixVPN-v$version.apk"
+        val proxyUrl: String get() = LOVABLE_DOWNLOAD_URL
     }
 
     private val checkClient = OkHttpClient.Builder()
@@ -204,13 +221,62 @@ object UpdateService {
     }
 
     /**
-     * Download the release APK into [destDir], reporting progress
-     * 0..100 via [onProgress]. Returns the downloaded file.
-     * Writes to a .tmp file and renames only on success, so a
-     * killed download can never masquerade as a complete APK.
+     * v1.61: download with Lovable-first + GitHub fallback.
+     * Attempt 1 is the existing Lovable route (same link as the
+     * homepage button). It is accepted only when the APK's own
+     * versionName matches the expected version — the route serves
+     * the CURRENT version, so during the window between a GitHub
+     * publish and the Lovable link update it would serve the OLD
+     * file. On any Lovable failure, or a version mismatch, attempt
+     * 2 is the versioned GitHub URL, which is always the right
+     * version. The version CHECK is unchanged (GitHub latest).
      */
     suspend fun download(
         context: Context,
+        info: ReleaseInfo,
+        destDir: File,
+        onProgress: (Int) -> Unit
+    ): Result<File> = withContext(Dispatchers.IO) {
+        val proxy = attemptDownload(context, info.proxyUrl, true, info, destDir, onProgress)
+        if (proxy.isSuccess) {
+            val file = proxy.getOrNull()!!
+            val got = downloadedVersion(context, file)
+            if (got == info.version) return@withContext proxy
+            Log.i(TAG, "Update download: Lovable served $got, expected ${info.version} — falling back to GitHub")
+            file.delete()
+        } else {
+            Log.i(TAG, "Update download: Lovable failed — falling back to GitHub")
+        }
+        attemptDownload(context, info.apkUrl, false, info, destDir, onProgress)
+    }
+
+    /** versionName recorded inside an APK file, or null if unreadable. */
+    private fun downloadedVersion(context: Context, file: File): String? = try {
+        val pm = context.packageManager
+        val archiveInfo = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            pm.getPackageArchiveInfo(file.absolutePath, PackageManager.PackageInfoFlags.of(0))
+        } else {
+            legacyArchiveInfo(pm, file)
+        }
+        archiveInfo?.versionName
+    } catch (_: Exception) {
+        null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun legacyArchiveInfo(pm: PackageManager, file: File) =
+        pm.getPackageArchiveInfo(file.absolutePath, 0)
+
+    /**
+     * One download attempt from [url] into [destDir], reporting
+     * progress 0..100 via [onProgress]. Returns the downloaded
+     * file. Writes to a .tmp file and renames only on success, so
+     * a killed download can never masquerade as a complete APK.
+     */
+    private suspend fun attemptDownload(
+        context: Context,
+        url: String,
+        viaProxy: Boolean,
         info: ReleaseInfo,
         destDir: File,
         onProgress: (Int) -> Unit
@@ -219,13 +285,14 @@ object UpdateService {
             destDir.mkdirs()
             val dest = File(destDir, info.apkName)
             val tmp = File(destDir, info.apkName + ".tmp")
+            if (tmp.exists()) tmp.delete()
             val client = boundClient(context, downloadClient) ?: downloadClient
             val req = Request.Builder()
-                .url(info.apkUrl)
+                .url(url)
                 .header("User-Agent", "PhoenixVPN (Android update)")
                 .get()
                 .build()
-            Log.i(TAG, "Update download: start " + info.apkName)
+            Log.i(TAG, "Update download: start " + info.apkName + if (viaProxy) " via Lovable" else " via GitHub")
             val t0 = SystemClock.elapsedRealtime()
             client.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) {
@@ -286,27 +353,31 @@ object UpdateService {
      */
     suspend fun diagnose(context: Context, info: ReleaseInfo): Result<String> =
         withContext(Dispatchers.IO) {
-            try {
-                val client = boundClient(context, downloadClient) ?: downloadClient
-                val req = Request.Builder()
-                    .url(info.apkUrl)
-                    .header("User-Agent", "PhoenixVPN (Android update)")
-                    .header("Range", "bytes=0-0")
-                    .get()
-                    .build()
-                val t0 = SystemClock.elapsedRealtime()
-                client.newCall(req).execute().use { resp ->
-                    val finalUrl = resp.request.url.toString()
-                    val summary = "Network diagnostic: HTTP " + resp.code +
-                        " final=" + finalUrl +
-                        " total=" + (SystemClock.elapsedRealtime() - t0) + "ms"
-                    Log.i(TAG, summary)
-                    Result.success(summary)
+            val client = boundClient(context, downloadClient) ?: downloadClient
+            var lastError: Exception? = null
+            for (url in listOf(info.proxyUrl, info.apkUrl)) {
+                try {
+                    val req = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", "PhoenixVPN (Android update)")
+                        .header("Range", "bytes=0-0")
+                        .get()
+                        .build()
+                    val t0 = SystemClock.elapsedRealtime()
+                    client.newCall(req).execute().use { resp ->
+                        val finalUrl = resp.request.url.toString()
+                        val summary = "Network diagnostic: HTTP " + resp.code +
+                            " final=" + finalUrl +
+                            " total=" + (SystemClock.elapsedRealtime() - t0) + "ms"
+                        Log.i(TAG, summary)
+                        return@withContext Result.success(summary)
+                    }
+                } catch (e: Exception) {
+                    Log.i(TAG, "Network diagnostic: failed " + e.javaClass.simpleName + ": " + e.message)
+                    lastError = e
                 }
-            } catch (e: Exception) {
-                Log.i(TAG, "Network diagnostic: failed " + e.javaClass.simpleName + ": " + e.message)
-                Result.failure(e)
             }
+            Result.failure(lastError ?: IOException("Diagnostic failed"))
         }
 
     /** Dotted numeric compare: "1.46" > "1.45"; missing parts = 0. */
