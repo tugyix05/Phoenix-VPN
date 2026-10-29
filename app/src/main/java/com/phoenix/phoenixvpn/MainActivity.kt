@@ -33,6 +33,32 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * HyperOS detection for the Fix navigation branch (v1.60).
+     * HyperOS keeps the current battery-exemption intent (it lands on the
+     * battery info screen); every other OS gets App Info, one tap from
+     * Battery saver. Detection is HyperOS-first with layered signals so a
+     * HyperOS device is never misrouted by a single missing signal; any
+     * failure defaults to NOT HyperOS (App Info), which always opens and
+     * never breaks.
+     */
+    private fun isHyperOS(): Boolean {
+        return try {
+            // Signal 1: HyperOS-only system property (absent on MIUI).
+            val systemProperties = Class.forName("android.os.SystemProperties")
+            val get = systemProperties.getMethod("get", String::class.java)
+            val osVersion = get.invoke(null, "ro.mi.os.version.name") as? String
+            if (!osVersion.isNullOrBlank()) return true
+            // Signal 2: Xiaomi build incremental starts with "OS" on HyperOS
+            // ("OS2.0...") vs "V" on MIUI ("V14...").
+            val manufacturer = Build.MANUFACTURER ?: ""
+            manufacturer.equals("Xiaomi", ignoreCase = true) &&
+                (Build.VERSION.INCREMENTAL ?: "").startsWith("OS", ignoreCase = true)
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
      * Battery-exemption screen. The exemption setting can take a moment to
      * propagate after the user grants it, so we wait ~1s before telling the
      * strip to re-check — this beats the ON_RESUME race the old flow had.
@@ -86,10 +112,19 @@ class MainActivity : ComponentActivity() {
             viewModel.batteryExemptionRequest.collect {
                 try {
                     batteryExemptionLauncher.launch(
-                        Intent(
-                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                            Uri.parse("package:$packageName")
-                        )
+                        if (isHyperOS()) {
+                            // HyperOS: unchanged — lands on the battery info screen.
+                            Intent(
+                                Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:$packageName")
+                            )
+                        } else {
+                            // Every other OS: App Info — one tap from Battery saver.
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:$packageName")
+                            )
+                        }
                     )
                 } catch (_: Exception) {
                     // Fall through: the ON_RESUME check in the strip remains.
