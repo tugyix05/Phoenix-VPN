@@ -626,6 +626,16 @@ class WireGuardManager(private val context: Context) {
         lastTxBytes = -1L
         lastRxProgressAt = System.currentTimeMillis()
         lastStaleRedrawAt = 0L
+        // Live-PING fix (2026-11-01, v1.62 walk regression): the walk's
+        // startTunnelAndAwaitHandshake already measured the real
+        // handshake latency in lastHandshakeMs, but the old code below
+        // recomputed it as (handshake epoch - polling start), which is
+        // negative when the handshake landed during the walk — coerced
+        // to a fake 0 ms for the whole session. Capture the walk value
+        // here and clear it, so a later polling restart (wake) cannot
+        // reuse a stale walk value.
+        val walkHandshakeMs = lastHandshakeMs
+        lastHandshakeMs = null
         tunnelUpWallMs = System.currentTimeMillis()
         _vpnState.update { it.copy(handshakeLive = false, livePingMs = null) }
         statsJob = scope.launch(Dispatchers.IO) {
@@ -641,8 +651,20 @@ class WireGuardManager(private val context: Context) {
                                 rxBytes = rx, txBytes = tx,
                                 handshakeLive = it.handshakeLive || landed,
                                 livePingMs = if (landed && it.livePingMs == null) {
-                                    (latestHandshakeEpoch(stats) - tunnelUpWallMs)
-                                        .coerceAtLeast(0L)
+                                    // Prefer the walk's live handshake
+                                    // latency (real, this session). Else
+                                    // the epoch-minus-polling-start value,
+                                    // but ONLY if positive — a stale
+                                    // handshake must never become 0 ms;
+                                    // staying null shows "–" honestly.
+                                    val walkMs = walkHandshakeMs
+                                    val calc =
+                                        latestHandshakeEpoch(stats) - tunnelUpWallMs
+                                    when {
+                                        walkMs != null && walkMs > 0 -> walkMs
+                                        calc > 0 -> calc
+                                        else -> it.livePingMs
+                                    }
                                 } else {
                                     it.livePingMs
                                 },
