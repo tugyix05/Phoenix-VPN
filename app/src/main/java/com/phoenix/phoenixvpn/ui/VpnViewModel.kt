@@ -311,6 +311,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      */
     private var tunnelEndpointId: String? = null
 
+    /**
+     * v1.62: true after a walk exhausted every candidate (pass 2 done,
+     * no handshake). The hero then shows "No endpoint connected" and
+     * the app stays stopped — until a manual ON, or a new feed, which
+     * auto-walks the new list at once. Not persisted: a process
+     * restart falls back to the persisted feed-pending flag instead.
+     */
+    private var walkExhausted = false
+
     init {
         // Restore persisted state into the manager (auto-run rules need it).
         val conf = store.baseConf
@@ -389,6 +398,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // v1.62 feed rule, network trigger (OR with manual on/off):
+        // a new feed alone never switches anything. If a feed is
+        // pending when the underlying network is lost, the next walk
+        // starts from the new feed's #1 — so point the stored
+        // selection AND the auto-run default tunnel at #1 now (the
+        // tunnel is unusable at this moment anyway: no internet),
+        // and clear the pending flag. A later manual ON then walks
+        // from #1 by the same stored selection.
+        viewModelScope.launch {
+            manager.networkLostEvent.collect {
+                onNetworkLostFeedTrigger()
+            }
+        }
+
         // Feed poll: Lovable relay first, GitHub raw fallback (user spec
         // 2026-10-28, no-VPN on all networks). No 6-hour gate: a new feed
         // is picked up on open and every 5 minutes while open, never on
@@ -462,16 +485,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Tap-to-connect flow:
+     * Tap-to-connect flow (v1.62, P-Tunnel-style walk):
      *   internet → VPN permission → fetch .conf (if missing) →
-     *   connect immediately on the card's top-3 (cached list, or bundled
-     *   on fresh install). Endpoint freshness is handled separately: the
-     *   Firebase signal watch (new feed → #1 auto-selected, tunnel
-     *   never switched) and the manual Refresh pill (update → replace,
-     *   no update → leave as-is). Tap never waits on — or triggers —
-     *   an endpoints fetch.
-     *   Then connect with failover (explicit → top-3 → last-working →
-     *   rest → bundled → manual; first candidate fire-and-forget).
+     *   flat walk over the full cached list (publisher order, bundled
+     *   trio only if no feed): start at last-connected, else #1 —
+     *   unless a new feed is pending, in which case this manual ON is
+     *   the feed trigger and the walk starts at the new feed's #1.
+     *   Per candidate 1 attempt, 5s handshake wait; first handshake
+     *   wins and becomes the new last-connected. Tap never waits on
+     *   — or triggers — an endpoints fetch.
      * Any step may abort back to disconnected with a toast reason.
      */
     fun connectFlow() {
@@ -506,24 +528,56 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     store.baseConf = conf
                 }
 
-                // 3. Endpoints: tap never fetches. Connect immediately on the
-                // card's top-3 (cached list, or bundled on fresh install).
-                // Freshness comes only from the 6-hour background check
-                // (update → replace, no update → leave as-is) and the manual
+                // 3. Endpoints: tap never fetches. The walk uses the
+                // cached list (or bundled trio on fresh install).
+                // Freshness comes only from the feed poll and the Home
                 // Refresh pill — never from a tap-time fetch.
                 refreshUpdatedAgo()
 
-                // 5. Connect with failover: fresh top-3 first, then cached,
-                // top-10 → bundled → manual. First handshake (~5s each)
-                // wins and stays connected.
+                // 5. Walk: manual ON is a feed trigger — a pending new
+                // feed starts the walk at the new feed's #1. Otherwise
+                // start at last-connected, else #1.
                 setPhase(SetupPhase.IDLE, "Connecting…")
                 manager.setUserOverride(false)
+                walkExhausted = false
+                val feedStart = if (store.feedRestartPending) {
+                    store.feedRestartPending = false
+                    store.effectiveList().firstOrNull()?.id
+                } else {
+                    null
+                }
                 refreshUiRows()
-                if (!connectWithFailover(conf, excludeId = null)) {
+                val manualNow = store.manualEndpoint
+                if (feedStart == null && manualNow != null &&
+                    store.currentEndpoint == manualNow
+                ) {
+                    // Last-connected IS manual: manual alone, fast
+                    // fire-and-forget (explicit manual tap rule).
+                    // Fast-fail to the published walk if it errors
+                    // at once (manual dies on connect -> published
+                    // walk, skipping manual); a stall while
+                    // connected is handled by failover instead.
+                    connectTo(manualNow, conf)
+                    delay(500)
+                    if (vpnState.value.connectionState ==
+                        TunnelConnectionState.ERROR
+                    ) {
+                        if (!connectWalk(
+                                conf, excludeId = manualNow,
+                                startId = publishedWalkList().firstOrNull()?.id
+                            )
+                        ) {
+                            walkExhausted = true
+                            VpnForegroundService.stopQuiet(app)
+                            message("No endpoint connected")
+                        }
+                    }
+                } else if (!connectWalk(conf, excludeId = null, startId = feedStart)) {
                     // All attempts failed: quiet cleanup (no manual-off
                     // semantics — the user did NOT ask to stop).
+                    walkExhausted = true
                     VpnForegroundService.stopQuiet(app)
-                    message("No working endpoint found")
+                    message("No endpoint connected")
                 }
             } finally {
                 if (vpnState.value.connectionState != TunnelConnectionState.CONNECTED &&
@@ -559,135 +613,132 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Try each candidate endpoint in order, waiting up to ~5s for the first
-     * handshake rx. The first handshake wins and stays connected.
-     * Order: stored current endpoint (explicit user choice / last winner)
-     * first, then published list (publisher order) → bundled → manual,
-     * deduped. Returns true on the first working endpoint, false if all
-     * failed.
+     * v1.62 flat walk (P-Tunnel-style, replaces the old
+     * explicit -> top-3 -> current -> rest -> bundled -> manual order,
+     * the first-candidate fire-and-forget, and the 1.5+1.5+5s reroll).
+     * Candidates = the full effective list (cached published list in
+     * publisher order, bundled trio only if no feed), minus
+     * user-deleted ids, with stored edits resolved. Manual is NEVER
+     * in this walk (it is tried alone, see selectEndpoint/connectTo).
+     * Pass 1: from [startId] (or last-connected, else #1) forward to
+     * the end. Pass 2: the full list again, in order. Per candidate
+     * exactly 1 attempt, 5s handshake wait via
+     * startTunnelAndAwaitHandshake; the first handshake wins, becomes
+     * the new last-connected, and ends the walk. Returns false only
+     * when both passes found nothing.
      */
-    private suspend fun connectWithFailover(conf: String, excludeId: String?): Boolean {
-        val seen = LinkedHashSet<String>()
-        val candidates = mutableListOf<EndpointInfo>()
-        fun add(e: EndpointInfo) {
-            if (seen.add(e.id)) candidates.add(e)
+    private suspend fun connectWalk(
+        conf: String,
+        excludeId: String?,
+        startId: String?
+    ): Boolean {
+        val published = publishedWalkList()
+        if (published.isEmpty()) return false
+        val start = when {
+            startId != null && published.any { it.id == startId } -> startId
+            else -> store.currentEndpoint?.takeIf { id ->
+                published.any { it.id == id }
+            } ?: published.first().id
         }
-        // Order: explicit user selection first, then fresh top-3
-        // (sequential), then the cached last-working endpoint, then the
-        // rest. First success wins.
-        val effective = store.effectiveList()
-        val explicit = store.explicitEndpoint
-        if (explicit != null && explicit != excludeId) {
-            // User tapped/added this — their direct command wins.
-            val found = (effective + EndpointStore.BUNDLED).firstOrNull { it.id == explicit }
-            if (found != null) {
-                add(found)
-            } else {
-                add(EndpointInfo(explicit.substringBefore(":"), explicit.substringAfter(":").toInt(), null, null))
-            }
-        }
-        effective.take(3).forEach { add(it) }
-        val cur = store.currentEndpoint
-        if (cur != null && cur != excludeId) {
-            // Cached endpoint after top-3 (add() dedupes if in top-3).
-            val found = (effective + EndpointStore.BUNDLED).firstOrNull { it.id == cur }
-            if (found != null) {
-                add(found)
-            } else {
-                // Not in any list — synthesize from the id.
-                val i = cur.lastIndexOf(':')
-                if (i > 0) {
-                    add(EndpointInfo(cur.substring(0, i), cur.substring(i + 1).toIntOrNull() ?: 500, null, null))
+        val startIdx = published.indexOfFirst { it.id == start }
+        val pass1 = if (startIdx >= 0) published.subList(startIdx, published.size) else published
+        val passes = listOf(pass1, published)
+        for (pass in passes) {
+            for (e in pass) {
+                currentCoroutineContext().job.ensureActive()
+                if (e.id == excludeId) continue
+                _ui.update { it.copy(statusLine = "Connecting\u2026 ${e.id}") }
+                val cfg = manager.swapEndpoint(conf, e.id)
+                val ok = try {
+                    manager.startTunnelAndAwaitHandshake(
+                        manager.tunnelNameFor(e.id), cfg, 5000L
+                    )
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    false
                 }
-            }
-        }
-        effective.drop(3).forEach { add(it) }
-        EndpointStore.BUNDLED.forEach { add(it) }
-        store.manualEndpoint?.let { raw ->
-            val i = raw.lastIndexOf(':')
-            if (i > 0) {
-                val port = raw.substring(i + 1).toIntOrNull() ?: 500
-                add(EndpointInfo(raw.substring(0, i), port, null, null))
-            }
-        }
-        var first = true
-        for (e in candidates) {
-            currentCoroutineContext().job.ensureActive()
-            if (e.id == excludeId) continue
-            _ui.update { it.copy(statusLine = "Connecting… ${e.id}") }
-            val cfg = manager.swapEndpoint(conf, e.id)
-            if (first) {
-                // Tugyi-style: fire-and-forget for the first candidate.
-                // No handshake wait — matches Auto VPN path. The 12s
-                // watchdog catches stalls; ERROR state triggers failover.
-                first = false
-                try {
-                    manager.setUserOverride(false)
+                if (ok) {
                     store.currentEndpoint = e.id
+                    // A published winner is no longer an explicit
+                    // manual choice (manual is a separate slot).
+                    if (store.explicitEndpoint != null &&
+                        store.explicitEndpoint != store.manualEndpoint
+                    ) {
+                        store.explicitEndpoint = null
+                    }
                     tunnelEndpointId = e.id
                     pushDefaultTunnel(conf, e.id)
                     refreshUiRows()
                     _ui.update { it.copy(currentMs = e.ms) }
-                    manager.startTunnel(manager.tunnelNameFor(e.id), cfg)
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Exception) {
-                    continue
+                    walkExhausted = false
+                    return true
                 }
-                // Brief pause for fast-fail (bad config, permission).
-                delay(500)
-                if (vpnState.value.connectionState == TunnelConnectionState.ERROR) {
-                    continue
-                }
-                return true
-            }
-            val ok = awaitHandshakeWithReroll(manager.tunnelNameFor(e.id), cfg)
-            if (ok) {
-                store.currentEndpoint = e.id
-                tunnelEndpointId = e.id
-                pushDefaultTunnel(conf, e.id)
-                refreshUiRows()
-                _ui.update { it.copy(currentMs = e.ms) }
-                return true
             }
         }
         return false
+    }
+
+    /** Walk candidates in list order, deleted + edited resolved. */
+    private fun publishedWalkList(): List<EndpointInfo> {
+        val deleted = store.deletedEndpoints
+        val edited = store.editedEndpoints
+        return store.effectiveList()
+            .filter { it.id !in deleted }
+            .map { e ->
+                val newId = edited[e.id]
+                if (newId != null) {
+                    val parts = newId.split(":")
+                    e.copy(
+                        ip = parts[0],
+                        port = parts.getOrNull(1)?.toIntOrNull() ?: e.port
+                    )
+                } else e
+            }
+    }
+
+    /** Next published id after [id] in walk order, or null if last. */
+    private fun successorOf(id: String?): String? {
+        if (id == null) return null
+        val list = publishedWalkList()
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0 || idx + 1 >= list.size) return null
+        return list[idx + 1].id
     }
 
     /**
-     * One endpoint, up to 3 rapid consecutive attempts (user spec
-     * 2026-10-23): on MPT a failed handshake is usually a dead NAT flow,
-     * and retransmits on the same flow never recover — only a full tunnel
-     * restart draws a new flow (the manual off/on toggle, automated).
-     * Each startTunnelAndAwaitHandshake call tears the tunnel fully DOWN
-     * on failure, so every attempt is a fresh socket/flow. The re-rolls
-     * get short 1.5s windows (a healthy line handshakes in ~250ms — no
-     * long waits); the last attempt keeps the full 5s before the caller
-     * moves on to the next endpoint.
+     * v1.62 feed rule, network trigger: if a new feed is pending
+     * when the underlying network is lost, the next walk starts
+     * from the new feed's #1. The tunnel is unusable at this
+     * moment (no internet), so point the stored selection and
+     * the auto-run default tunnel at #1 now and clear the flag;
+     * a later manual ON then walks from #1 by stored selection,
+     * and an auto-run return also starts at #1.
      */
-    private suspend fun awaitHandshakeWithReroll(name: String, cfg: String): Boolean {
-        val windows = longArrayOf(1500L, 1500L, 5000L)
-        for (w in windows) {
-            val ok = try {
-                manager.startTunnelAndAwaitHandshake(name, cfg, w)
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Exception) {
-                false
-            }
-            if (ok) return true
-        }
-        return false
+    private fun onNetworkLostFeedTrigger() {
+        if (!store.feedRestartPending) return
+        val first = store.effectiveList().firstOrNull() ?: return
+        store.feedRestartPending = false
+        store.currentEndpoint = first.id
+        store.explicitEndpoint = null
+        store.baseConf?.let { conf -> pushDefaultTunnel(conf, first.id) }
+        refreshUiRows()
     }
 
-    /** Fail over to the next endpoint when the current one dies. */
+    /**
+     * Fail over when the current endpoint dies (v1.62 walk).
+     * Exclude the LIVE tunnel's endpoint, not the UI selection.
+     * Walk start: the successor of the dead endpoint in list order
+     * (pass 1 to the end, pass 2 full) — retrying the dead endpoint
+     * first would waste a 5s attempt on a known-dead destination.
+     * A dead manual endpoint has no successor in the published
+     * list, so the walk starts at the published #1, skipping manual.
+     * A pending new feed also starts at its #1 (feed trigger).
+     */
     private fun failover(reason: String) {
         if (manager.isUserOverride()) return
         val st = vpnState.value.connectionState
         if (st != TunnelConnectionState.CONNECTED && st != TunnelConnectionState.CONNECTING) return
-        // Exclude the LIVE tunnel's endpoint, not the UI selection:
-        // after an auto-select while connected those differ, and
-        // excluding the selection would wrongly skip the healthy new #1.
         val cur = tunnelEndpointId ?: _ui.value.currentId
         val conf = store.baseConf ?: return
         message(reason)
@@ -696,10 +747,19 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 manager.stopTunnel()
             } catch (_: Exception) {
             }
-            if (!connectWithFailover(conf, excludeId = cur)) {
+            val walkStart = if (store.feedRestartPending) {
+                store.feedRestartPending = false
+                store.effectiveList().firstOrNull()?.id
+            } else if (cur == store.manualEndpoint) {
+                publishedWalkList().firstOrNull()?.id
+            } else {
+                successorOf(cur)
+            }
+            if (!connectWalk(conf, excludeId = cur, startId = walkStart)) {
                 // Quiet cleanup: the user did NOT manually stop.
+                walkExhausted = true
                 VpnForegroundService.stopQuiet(app)
-                message("No working endpoint found")
+                message("No endpoint connected")
             }
         }
     }
@@ -711,8 +771,15 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun openSheet() = _ui.update { it.copy(sheetOpen = true) }
     fun closeSheet() = _ui.update { it.copy(sheetOpen = false) }
 
+    /**
+     * v1.62: only the manual slot is selectable from the sheet.
+     * A published row tap closes the sheet only (HomeScreen), and
+     * any stray published id reaching here is treated the same —
+     * the walk decides published endpoints, never a sheet tap.
+     */
     fun selectEndpoint(id: String) {
         closeSheet()
+        if (id != store.manualEndpoint) return
         store.currentEndpoint = id
         store.explicitEndpoint = id
         _ui.update { it.copy(newBestAvailable = false) }
@@ -847,11 +914,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun closeAbout() = _ui.update { it.copy(aboutOpen = false) }
 
     /**
-     * Main-screen Refresh (feed only, split from live measurement): fetches
-     * endpoints.json immediately, bypassing the 6-hour gate. New feed = new
-     * baseline, so live values clear. The fetch is bound to the underlying
-     * network, so it works with the tunnel up or down. Live measurement
-     * lives in the sheet (refreshLiveMs) and still needs the tunnel down.
+     * Main-screen Refresh (feed only): fetches endpoints.json
+     * immediately. The fetch is bound to the underlying network, so
+     * it works with the tunnel up or down. v1.62: the sheet Refresh
+     * pill is removed, so there is no live measurement anymore —
+     * this pill only refreshes the feed (see fetchAndApplyFeed).
      */
     fun refreshEndpointsNow() {
         viewModelScope.launch {
@@ -874,7 +941,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private fun isTestTunnelName(name: String?): Boolean =
         name?.startsWith("live-measure") == true
 
-    /** Sheet Refresh (live ms only): measures every sheet row, no feed fetch. */
+    /**
+     * DORMANT in v1.62: the sheet Refresh pill was removed by user
+     * decision, so nothing calls this anymore. Kept (not deleted)
+     * to keep the v1.62 diff surgical; remove in a later cleanup
+     * if the measurement path is confirmed dead.
+     * Sheet Refresh (live ms only): measures every sheet row, no feed fetch.
+     */
     fun refreshLiveMs() {
         if (liveMeasureRunning) return
         viewModelScope.launch {
@@ -1315,7 +1388,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
      * Polls the feed: an immediate fetch on start (the on-open fetch),
      * then every 5 minutes while this ViewModel lives (viewModelScope
      * cancels the loop on clear). A new feed is applied by
-     * fetchAndApplyFeed (auto-select #1, tunnel untouched). Polling
+     * fetchAndApplyFeed (list replaced, feed flag armed, tunnel
+     * untouched). Polling
      * replaces the Firebase signal listener: the relay is reachable
      * on networks where Firebase is not, so the feed itself is the
      * change signal — no separate signal channel is needed. A
@@ -1334,19 +1408,21 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Fetches the published list and applies it. Returns true only on
-     * a successful fetch. Silent on the auto path (same as before).
-     *
-     * New feed (different updated_at, or a different endpoint set) =
-     * stored list becomes the new list AND #1 is auto-SELECTED —
-     * even while connected, even after a manual off (user spec
-     * 2026-10-28). The live tunnel is NEVER touched here — no
-     * stop, no restart, no default-tunnel change — so the tunnel
-     * keeps running on the old endpoint and the internet is never
-     * cut (user constraint 2026-10-28 18:25). Only the stored
-     * selection + UI change. A manual tap still overrides the
-     * selection until the next new feed. An unchanged feed touches
-     * nothing but the stored list.
+     * Fetches the published list and applies it (v1.62 feed rule).
+     * Returns true only on a successful fetch. Silent on the auto
+     * path. A new feed (different updated_at, or a different
+     * endpoint set) ONLY replaces the stored list and arms
+     * feedRestartPending — it NEVER changes the stored selection,
+     * NEVER clears an explicit manual choice, and NEVER touches
+     * the live tunnel, so the tunnel keeps running on the old
+     * endpoint and the internet is never cut. The next walk starts
+     * from the new feed's #1 only after a trigger: a manual ON
+     * (connectFlow consumes the flag), or a network loss
+     * (onNetworkLostFeedTrigger). Exception: a walk that already
+     * exhausted ("No endpoint connected") auto-walks the new list
+     * at once, with no trigger waited for — otherwise exhaustion
+     * would never recover on its own. A manual OFF (user override)
+     * is NOT exhaustion, so it never auto-walks here.
      */
     private suspend fun fetchAndApplyFeed(): Boolean {
         // No validated-internet gate (deliberate, 2026-10-28): the relay
@@ -1366,15 +1442,27 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             f.endpoints.map { it.id } != oldIds
         store.saveFetched(f, now())
         refreshUpdatedAgo()
-        // v1.48: a live tunnel is never disturbed and never switched:
-        // a degraded line is woken in place by the stall wake.
         if (isNew) {
-            f.endpoints.firstOrNull()?.let { first ->
-                store.currentEndpoint = first.id
-                store.explicitEndpoint = null
-            }
+            store.feedRestartPending = true
         }
         refreshUiRows()
+        if (isNew && walkExhausted && !manager.isUserOverride()) {
+            val conf = store.baseConf
+            if (conf != null && f.endpoints.isNotEmpty()) {
+                store.feedRestartPending = false
+                viewModelScope.launch {
+                    if (!connectWalk(
+                            conf,
+                            excludeId = null,
+                            startId = f.endpoints.first().id
+                        )
+                    ) {
+                        VpnForegroundService.stopQuiet(app)
+                        message("No endpoint connected")
+                    }
+                }
+            }
+        }
         return true
     }
 
@@ -1395,30 +1483,47 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         return store.effectiveList().firstOrNull { it.id == id }?.ms
     }
 
+    /**
+     * v1.62 sheet rows: exactly ONE published row — the
+     * current/last-connected endpoint — plus the manual slot
+     * (rendered separately by HomeScreen). If the stored current
+     * id is the manual id, the published row falls back to the
+     * walk list's #1 for display; if the stored id is no longer
+     * in the list (new feed dropped it), the row still shows the
+     * stored id while connected (the live tunnel is on it), and
+     * #1 once disconnected (the next walk falls back to #1).
+     * isBest is always false now: there is no top-3 ranking.
+     */
     private fun refreshUiRows() {
-        val deleted = store.deletedEndpoints
-        val edited = store.editedEndpoints
-        val top3 = store.effectiveList()
-            .filter { it.id !in deleted }
-            .map { e ->
-                val newId = edited[e.id]
-                if (newId != null) {
-                    val parts = newId.split(":")
-                    e.copy(ip = parts[0], port = parts.getOrNull(1)?.toIntOrNull() ?: e.port)
-                } else e
-            }
-            .take(3)
-        val cur = store.currentEndpoint ?: top3.firstOrNull()?.id
-        val manual = store.manualEndpoint
-        val rows = top3.mapIndexed { i, e ->
-            EndpointRow(
-                id = e.id,
-                ms = e.ms,
-                isBest = i == 0,
-                isCurrent = e.id == cur,
-                isManual = false
-            )
+        val walkList = publishedWalkList()
+        val stored = store.currentEndpoint
+        val connected = vpnState.value.connectionState ==
+            TunnelConnectionState.CONNECTED
+        // Home chip id: the stored selection, manual included.
+        val cur = stored ?: walkList.firstOrNull()?.id
+        // Sheet published row: the published current, or #1 when the
+        // stored selection is manual / absent / dropped from the list
+        // (connected + dropped keeps showing the stored id, since the
+        // live tunnel is on it).
+        val rowId = when {
+            stored == null -> walkList.firstOrNull()?.id
+            stored == store.manualEndpoint -> walkList.firstOrNull()?.id
+            walkList.any { it.id == stored } -> stored
+            connected -> stored
+            else -> walkList.firstOrNull()?.id
         }
+        val manual = store.manualEndpoint
+        val rows = rowId?.let { id ->
+            listOf(
+                EndpointRow(
+                    id = id,
+                    ms = msFor(id),
+                    isBest = false,
+                    isCurrent = id == cur,
+                    isManual = false
+                )
+            )
+        } ?: emptyList()
         _ui.update {
             it.copy(
                 rows = rows,

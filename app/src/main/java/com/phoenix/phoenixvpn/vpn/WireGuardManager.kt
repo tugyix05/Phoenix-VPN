@@ -81,6 +81,17 @@ class WireGuardManager(private val context: Context) {
     private val _endpointDeadEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val endpointDeadEvent: SharedFlow<Unit> = _endpointDeadEvent.asSharedFlow()
 
+    /**
+     * v1.62: fires on every underlying-network loss (NetworkCallback
+     * onLost), before the debounced auto-tunnel rules run. The UI
+     * layer uses it as the P-Tunnel-style feed rule's network trigger:
+     * if a new feed is pending, the next walk starts from the new
+     * feed's #1. Firing here (not in the rules) keeps the trigger
+     * independent of whether auto-run is enabled.
+     */
+    private val _networkLostEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val networkLostEvent: SharedFlow<Unit> = _networkLostEvent.asSharedFlow()
+
     private var currentTunnel: PhoenixTunnel? = null
 
     /** Pure handshake RTT (ms) from the last startTunnelAndAwaitHandshake —
@@ -1016,6 +1027,7 @@ class WireGuardManager(private val context: Context) {
      * user action (tap connect / enable auto-run) clears it.
      */
     private fun onNetworkLost() {
+        _networkLostEvent.tryEmit(Unit)
         scheduleRulesCheck(delayMs = 1000L)
     }
 

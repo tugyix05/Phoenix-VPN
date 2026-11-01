@@ -70,6 +70,17 @@ class EndpointStore(context: Context) {
         get() = prefs.getBoolean(KEY_AUTORUN, false)
         set(v) = prefs.edit().putBoolean(KEY_AUTORUN, v).apply()
 
+    /**
+     * v1.62 (P-Tunnel-style walk): a new feed has arrived since the
+     * last walk started. Feed arrival alone never changes the stored
+     * selection or the live tunnel — it only arms this flag. The NEXT
+     * walk (a manual on, or a network-lost trigger) then starts from
+     * the new feed's #1 and clears the flag at walk start.
+     */
+    var feedRestartPending: Boolean
+        get() = prefs.getBoolean(KEY_FEED_PENDING, false)
+        set(v) = prefs.edit().putBoolean(KEY_FEED_PENDING, v).apply()
+
     fun saveFetched(f: FetchedEndpoints, now: Long) {
         cachedEndpoints = f.endpoints
         cachedAt = now
@@ -146,6 +157,7 @@ class EndpointStore(context: Context) {
         private const val KEY_DELETED = "deleted_endpoints"
         private const val KEY_EDITED = "edited_endpoints"
         private const val KEY_AUTORUN = "auto_run"
+        private const val KEY_FEED_PENDING = "feed_restart_pending"
 
         /** Re-download endpoints.json after this long. */
         const val CACHE_TTL_MS = 6 * 60 * 60 * 1000L

@@ -137,6 +137,17 @@ class VpnForegroundService : Service() {
         super.onCreate()
         serviceRunning = true
         createNotificationChannel()
+        // v1.62 crash fix (ForegroundServiceDidNotStartInTimeException,
+        // Crashlytics 2026-10-31, v1.26–v1.61): a service started with
+        // startForegroundService() must call startForeground() within
+        // the system timeout, but the old code only called it in
+        // onStartCommand — so a delayed onStartCommand delivery (busy
+        // main thread during rapid connect/disconnect/connect) missed
+        // the window and Android killed the app. Calling it here, in
+        // onCreate, is the earliest possible point and closes that
+        // window for every start path, including START_STICKY
+        // redelivery with a null intent.
+        startForeground(NOTIFICATION_ID, buildNotification(this, lastConnected))
     }
 
     override fun onDestroy() {
@@ -153,6 +164,12 @@ class VpnForegroundService : Service() {
                 startForeground(NOTIFICATION_ID, buildNotification(this, lastConnected))
             }
             ACTION_STOP -> {
+                // v1.62: re-assert foreground first. A stop intent can
+                // reach a freshly created instance (e.g. startService
+                // racing a pending startForegroundService) — without
+                // this, that instance could still miss the foreground
+                // timeout before it stops itself.
+                startForeground(NOTIFICATION_ID, buildNotification(this, lastConnected))
                 // "ရပ်ရန်" behaves as MANUAL-OFF: it sets the user override
                 // (so auto-run never resurrects the tunnel) and brings the
                 // tunnel down for real — not just killing the service.
@@ -167,6 +184,7 @@ class VpnForegroundService : Service() {
                 // Internal failure cleanup only: stop the service WITHOUT
                 // manual-off semantics. Never touches WireGuardManager, never
                 // sets the user override.
+                startForeground(NOTIFICATION_ID, buildNotification(this, lastConnected))
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }

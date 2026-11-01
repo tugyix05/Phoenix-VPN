@@ -17,7 +17,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -397,10 +396,10 @@ fun HomeScreen(viewModel: VpnViewModel) {
                     color = if (ui.stale) Amber else TextDim,
                     fontSize = 12.sp
                 )
-                // Feed Refresh (split): the feed fetch is bound to the
+                // Feed Refresh: the feed fetch is bound to the
                 // underlying network, so it works with the tunnel up or
-                // down — always lit. Live measurement lives in the sheet
-                // and still needs the tunnel down (see sheet header).
+                // down — always lit. v1.62: the sheet Refresh pill is
+                // removed, so this is the only Refresh left.
                 val refreshEnabled = true
                 val refreshColor = if (refreshEnabled) Teal else TextMuted
                 Row(
@@ -540,42 +539,9 @@ fun HomeScreen(viewModel: VpnViewModel) {
                                     modifier = Modifier.padding(top = 3.dp)
                                 )
                             }
-                            // Sheet Refresh (ms only, mockup sheet-head pill):
-                            // lit only with the tunnel down and no
-                            // measurement running; tap measures rows only.
-                            val sheetRefreshEnabled = (vpn.connectionState == TunnelConnectionState.DISCONNECTED ||
-                                vpn.connectionState == TunnelConnectionState.ERROR) &&
-                                ui.measuringIds.isEmpty()
-                            val sheetRefreshColor = if (sheetRefreshEnabled) Teal else TextMuted
-                            Row(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(50))
-                                    .background(if (sheetRefreshEnabled) Teal.copy(alpha = 0.12f) else Color.Transparent)
-                                    .border(1.dp, if (sheetRefreshEnabled) Teal.copy(alpha = 0.4f) else TextMuted.copy(alpha = 0.4f), RoundedCornerShape(50))
-                                    // Diagnostic probe (v1.56, temporary):
-                                    // long-press runs P0-P4; tap still measures.
-                                    .combinedClickable(
-                                        enabled = sheetRefreshEnabled,
-                                        onClick = { viewModel.refreshLiveMs() },
-                                        onLongClick = { viewModel.runProbe(); true }
-                                    )
-                                    .padding(horizontal = 10.dp, vertical = 5.dp),
-                                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Refresh,
-                                    contentDescription = "Refresh live ms",
-                                    tint = sheetRefreshColor,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Text(
-                                    text = "Refresh",
-                                    color = sheetRefreshColor,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
+                            // v1.62: sheet Refresh pill REMOVED by user decision
+                            // (2026-11-01 mockup approval). No live-ms measurement
+                            // from the sheet anymore; feed Refresh on Home stays.
                         }
                     },
                     rows = {
@@ -604,7 +570,11 @@ fun HomeScreen(viewModel: VpnViewModel) {
                                 displayMs = rowDisplayMs,
                                 isLive = rowIsLive,
                                 isMeasuring = rowShowDots,
-                                onTap = { viewModel.selectEndpoint(row.id) }
+                                // v1.62: current published row tap = close
+                                // sheet only (mockup decision 2026-11-01).
+                                // Published endpoints are never
+                                // tap-selected; the walk decides.
+                                onTap = { viewModel.closeSheet() }
                             )
                         }
                     },
