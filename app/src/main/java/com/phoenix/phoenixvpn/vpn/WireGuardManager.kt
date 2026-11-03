@@ -648,6 +648,14 @@ class WireGuardManager(private val context: Context) {
         ) return
         if (checkVpnPermission() != null) return
         val conf = endpointStore.baseConf ?: return
+        // No-internet pre-check (user 2026-11-03): never start an auto
+        // walk without a LIVE validated underlying network. Skip
+        // silently WITHOUT setting exhausted — the 15s periodic check
+        // or the next validated event retries. Rule 1's caps check can
+        // pass on a stale cache; this fresh scan does not trust it, so
+        // a walk cancelled mid-cycle by a flap does not restart while
+        // the real networks are still down.
+        if (!hasLiveUsableNetwork()) return
         autoWalkJob = scope.launch(Dispatchers.IO) {
             try {
                 if (walkEndpoints(conf, startId = null, excludeId = null) != null) {
@@ -662,6 +670,28 @@ class WireGuardManager(private val context: Context) {
                 autoWalkExhausted = true
             }
         }
+    }
+
+    /**
+     * Live usable-network scan: a FRESH pass over all underlying
+     * networks for NOT_VPN + INTERNET + VALIDATED. Unlike
+     * getUnderlyingNetworkCapabilities(), this never trusts the cached
+     * currentUnderlyingNetwork — a stale-green cache must not
+     * green-light a walk while the real networks are down.
+     */
+    private fun hasLiveUsableNetwork(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? ConnectivityManager ?: return false
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            ) {
+                return true
+            }
+        }
+        return false
     }
 
     /**
