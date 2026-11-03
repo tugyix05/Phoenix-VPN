@@ -77,6 +77,13 @@ class WireGuardManager(private val context: Context) {
     private val _vpnState = MutableStateFlow(VpnUiState())
     val vpnState: StateFlow<VpnUiState> = _vpnState.asStateFlow()
 
+    // Current walk candidate, for the UI mirror: walkEndpoints sets this
+    // on every attempt (manual AND auto) and clears it when the walk
+    // ends, so the hero can show "Connecting… <id>" during manager-scope
+    // auto walks that carry no onCandidate callback.
+    private val _walkCandidate = MutableStateFlow<EndpointInfo?>(null)
+    val walkCandidate: StateFlow<EndpointInfo?> = _walkCandidate.asStateFlow()
+
     /**
      * v1.64 (P-Tunnel flow): fires when the watchdog confirms the current
      * endpoint is unusable — rx stalled through the grace period, or the
@@ -564,6 +571,8 @@ class WireGuardManager(private val context: Context) {
      * at once — no same-endpoint DOWN→UP re-rolls anywhere in this
      * file anymore. [onCandidate] reports each attempt to the caller
      * (the manual walk uses it for its "Connecting… <id>" line).
+     * [walkCandidate] mirrors the same attempt for the UI, so auto
+     * walks (no onCandidate) show their current candidate too.
      */
     suspend fun walkEndpoints(
         conf: String,
@@ -586,31 +595,36 @@ class WireGuardManager(private val context: Context) {
         val startIdx = published.indexOfFirst { it.id == start }
         val pass1 = if (startIdx >= 0) published.subList(startIdx, published.size) else published
         val passes = listOf(pass1 to WALK_TIMEOUT_QUICK_MS, published to WALK_TIMEOUT_MS)
-        for ((pass, timeoutMs) in passes) {
-            for (e in pass) {
-                currentCoroutineContext().ensureActive()
-                if (e.id == excludeId) continue
-                onCandidate?.invoke(e)
-                val cfg = swapEndpoint(conf, e.id)
-                val ok = try {
-                    startTunnelAndAwaitHandshake(tunnelNameFor(e.id), cfg, timeoutMs)
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Exception) {
-                    false
-                }
-                if (ok) {
-                    endpointStore.currentEndpoint = e.id
-                    if (endpointStore.explicitEndpoint != null &&
-                        endpointStore.explicitEndpoint != endpointStore.manualEndpoint
-                    ) {
-                        endpointStore.explicitEndpoint = null
+        try {
+            for ((pass, timeoutMs) in passes) {
+                for (e in pass) {
+                    currentCoroutineContext().ensureActive()
+                    if (e.id == excludeId) continue
+                    onCandidate?.invoke(e)
+                    _walkCandidate.value = e
+                    val cfg = swapEndpoint(conf, e.id)
+                    val ok = try {
+                        startTunnelAndAwaitHandshake(tunnelNameFor(e.id), cfg, timeoutMs)
+                    } catch (ce: CancellationException) {
+                        throw ce
+                    } catch (_: Exception) {
+                        false
                     }
-                    return e
+                    if (ok) {
+                        endpointStore.currentEndpoint = e.id
+                        if (endpointStore.explicitEndpoint != null &&
+                            endpointStore.explicitEndpoint != endpointStore.manualEndpoint
+                        ) {
+                            endpointStore.explicitEndpoint = null
+                        }
+                        return e
+                    }
                 }
             }
+            return null
+        } finally {
+            _walkCandidate.value = null
         }
-        return null
     }
 
     /**

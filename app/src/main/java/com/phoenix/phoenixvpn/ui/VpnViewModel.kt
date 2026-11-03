@@ -395,6 +395,24 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // Auto-walk candidate mirror: manager-scope walks (auto) carry no
+        // onCandidate, so without this the hero shows only generic
+        // "Connecting…" during auto walks. Mirror the walk's current
+        // candidate into statusLine exactly like the manual path does;
+        // on walk end clear it only if it still holds our line, so
+        // Probing… / banner lines are never clobbered.
+        viewModelScope.launch {
+            manager.walkCandidate.collect { cand ->
+                _ui.update {
+                    when {
+                        cand != null -> it.copy(statusLine = "Connecting\u2026 ${cand.id}")
+                        it.statusLine?.startsWith("Connecting\u2026") == true -> it.copy(statusLine = null)
+                        else -> it
+                    }
+                }
+            }
+        }
+
         // v1.62 feed rule, network trigger (OR with manual on/off):
         // a new feed alone never switches anything. If a feed is
         // pending when the underlying network is lost, the next walk
