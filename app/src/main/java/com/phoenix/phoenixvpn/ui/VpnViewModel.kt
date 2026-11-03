@@ -321,13 +321,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private var walkExhausted = false
 
     init {
-        // Restore persisted state into the manager (auto-run rules need it).
-        val conf = store.baseConf
+        // Restore persisted state into the UI (the auto walk reads the
+        // base .conf and the list straight from the store now).
         val cur = store.currentEndpoint ?: store.effectiveList().firstOrNull()?.id
             ?: EndpointStore.BUNDLED.first().id
-        if (conf != null) {
-            pushDefaultTunnel(conf, cur)
-        }
         _ui.update {
             it.copy(
                 autoRun = store.autoRun,
@@ -485,19 +482,22 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Tap-to-connect flow (v1.62, P-Tunnel-style walk):
+     * Tap-to-connect flow (v1.62 walk, v1.64 two-speed):
      *   internet → VPN permission → fetch .conf (if missing) →
      *   flat walk over the full cached list (publisher order, bundled
      *   trio only if no feed): start at last-connected, else #1 —
      *   unless a new feed is pending, in which case this manual ON is
      *   the feed trigger and the walk starts at the new feed's #1.
-     *   Per candidate 1 attempt, 5s handshake wait; first handshake
-     *   wins and becomes the new last-connected. Tap never waits on
-     *   — or triggers — an endpoints fetch.
+     *   Per candidate 1 attempt; pass 1 waits 2s, pass 2 waits 5s;
+     *   first handshake wins and becomes the new last-connected.
+     *   Tap never waits on — or triggers — an endpoints fetch.
      * Any step may abort back to disconnected with a toast reason.
      */
     fun connectFlow() {
         if (connectJob?.isActive == true) return
+        // A manual walk owns the tunnel now — a manager auto walk
+        // must not fight it for the next candidate.
+        manager.cancelAutoWalk()
         connectJob = viewModelScope.launch {
             try {
                 // 1. Internet first — no point asking for anything without it.
@@ -551,17 +551,13 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 if (feedStart == null && manualNow != null &&
                     store.currentEndpoint == manualNow
                 ) {
-                    // Last-connected IS manual: manual alone, fast
-                    // fire-and-forget (explicit manual tap rule).
-                    // Fast-fail to the published walk if it errors
-                    // at once (manual dies on connect -> published
-                    // walk, skipping manual); a stall while
-                    // connected is handled by failover instead.
-                    connectTo(manualNow, conf)
-                    delay(500)
-                    if (vpnState.value.connectionState ==
-                        TunnelConnectionState.ERROR
-                    ) {
+                    // Last-connected IS manual: the manual choice gets
+                    // one verified 5s attempt (v1.64 — no more
+                    // fire-and-forget + birth wake on one endpoint).
+                    // On failure, fall to the published walk, skipping
+                    // manual; a stall while connected is handled by
+                    // failover instead.
+                    if (!connectTo(manualNow, conf)) {
                         if (!connectWalk(
                                 conf, excludeId = manualNow,
                                 startId = publishedWalkList().firstOrNull()?.id
@@ -591,111 +587,71 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private suspend fun connectTo(endpointId: String, conf: String) {
+    /**
+     * Explicit manual choice, v1.64: one verified 5s attempt (the
+     * pass-2 window). Returns true on a landed handshake. No more
+     * fire-and-forget + birth wake on one endpoint — on failure the
+     * caller falls back to the published walk, skipping manual.
+     * The caller owns all messaging on failure.
+     */
+    private suspend fun connectTo(endpointId: String, conf: String): Boolean {
         val cfg = manager.swapEndpoint(conf, endpointId)
         manager.setUserOverride(false)
         store.currentEndpoint = endpointId
         tunnelEndpointId = endpointId
-        pushDefaultTunnel(conf, endpointId)
         refreshUiRows()
         _ui.update { it.copy(currentMs = msFor(endpointId)) }
-        // Fire-and-forget, as the user wants it: the switch shows
-        // connected immediately. The handshake is NOT awaited here —
-        // since v1.39 the manager's birth wake owns persistence: it
-        // keeps re-drawing flows behind the "connected" UI until the
-        // first handshake lands on the endpoint the user picked. No
-        // failover away from an explicit choice, no fake-idle wait.
-        manager.startTunnel(manager.tunnelNameFor(endpointId), cfg)
-        if (vpnState.value.connectionState == TunnelConnectionState.ERROR) {
-            message(vpnState.value.errorMessage ?: "Connection failed")
+        val ok = try {
+            manager.startTunnelAndAwaitHandshake(
+                manager.tunnelNameFor(endpointId), cfg, 5000L
+            )
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (_: Exception) {
+            false
+        }
+        if (ok) {
+            walkExhausted = false
+            manager.clearAutoWalkExhausted()
+        } else {
             _ui.update { it.copy(statusLine = null) }
         }
+        return ok
     }
 
     /**
-     * v1.62 flat walk (P-Tunnel-style, replaces the old
-     * explicit -> top-3 -> current -> rest -> bundled -> manual order,
-     * the first-candidate fire-and-forget, and the 1.5+1.5+5s reroll).
-     * Candidates = the full effective list (cached published list in
-     * publisher order, bundled trio only if no feed), minus
-     * user-deleted ids, with stored edits resolved. Manual is NEVER
-     * in this walk (it is tried alone, see selectEndpoint/connectTo).
-     * Pass 1: from [startId] (or last-connected, else #1) forward to
-     * the end. Pass 2: the full list again, in order. Per candidate
-     * exactly 1 attempt, 5s handshake wait via
-     * startTunnelAndAwaitHandshake; the first handshake wins, becomes
-     * the new last-connected, and ends the walk. Returns false only
-     * when both passes found nothing.
+     * v1.64 walk: thin UI wrapper over the manager's shared two-speed
+     * walk (pass 1 = 2s/ep, pass 2 = 5s/ep — same walk the auto path
+     * runs). The manager owns candidates, attempts and the
+     * last-connected store; this wrapper only mirrors the win into
+     * the UI and tracks exhaustion. Returns false only when both
+     * passes found nothing. A failed walk also arms the manager's
+     * auto-exhaustion flag, so auto-run does not immediately re-walk
+     * a dead list (P-Tunnel rule: stay stopped until manual ON or a
+     * new feed).
      */
     private suspend fun connectWalk(
         conf: String,
         excludeId: String?,
         startId: String?
     ): Boolean {
-        val published = publishedWalkList()
-        if (published.isEmpty()) return false
-        val start = when {
-            startId != null && published.any { it.id == startId } -> startId
-            else -> store.currentEndpoint?.takeIf { id ->
-                published.any { it.id == id }
-            } ?: published.first().id
+        val winner = manager.walkEndpoints(conf, startId, excludeId) { e ->
+            _ui.update { it.copy(statusLine = "Connecting\u2026 ${e.id}") }
         }
-        val startIdx = published.indexOfFirst { it.id == start }
-        val pass1 = if (startIdx >= 0) published.subList(startIdx, published.size) else published
-        val passes = listOf(pass1, published)
-        for (pass in passes) {
-            for (e in pass) {
-                currentCoroutineContext().job.ensureActive()
-                if (e.id == excludeId) continue
-                _ui.update { it.copy(statusLine = "Connecting\u2026 ${e.id}") }
-                val cfg = manager.swapEndpoint(conf, e.id)
-                val ok = try {
-                    manager.startTunnelAndAwaitHandshake(
-                        manager.tunnelNameFor(e.id), cfg, 5000L
-                    )
-                } catch (ce: CancellationException) {
-                    throw ce
-                } catch (_: Exception) {
-                    false
-                }
-                if (ok) {
-                    store.currentEndpoint = e.id
-                    // A published winner is no longer an explicit
-                    // manual choice (manual is a separate slot).
-                    if (store.explicitEndpoint != null &&
-                        store.explicitEndpoint != store.manualEndpoint
-                    ) {
-                        store.explicitEndpoint = null
-                    }
-                    tunnelEndpointId = e.id
-                    pushDefaultTunnel(conf, e.id)
-                    refreshUiRows()
-                    _ui.update { it.copy(currentMs = e.ms) }
-                    walkExhausted = false
-                    return true
-                }
-            }
+        if (winner != null) {
+            tunnelEndpointId = winner.id
+            refreshUiRows()
+            _ui.update { it.copy(currentMs = winner.ms) }
+            walkExhausted = false
+            manager.clearAutoWalkExhausted()
+            return true
         }
+        manager.setAutoWalkExhausted()
         return false
     }
 
     /** Walk candidates in list order, deleted + edited resolved. */
-    private fun publishedWalkList(): List<EndpointInfo> {
-        val deleted = store.deletedEndpoints
-        val edited = store.editedEndpoints
-        return store.effectiveList()
-            .filter { it.id !in deleted }
-            .map { e ->
-                val newId = edited[e.id]
-                if (newId != null) {
-                    val parts = newId.split(":")
-                    e.copy(
-                        ip = parts[0],
-                        port = parts.getOrNull(1)?.toIntOrNull() ?: e.port
-                    )
-                } else e
-            }
-    }
+    private fun publishedWalkList(): List<EndpointInfo> = store.walkList()
 
     /** Next published id after [id] in walk order, or null if last. */
     private fun successorOf(id: String?): String? {
@@ -721,7 +677,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         store.feedRestartPending = false
         store.currentEndpoint = first.id
         store.explicitEndpoint = null
-        store.baseConf?.let { conf -> pushDefaultTunnel(conf, first.id) }
         refreshUiRows()
     }
 
@@ -792,14 +747,26 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         if (id == _ui.value.currentId &&
             vpnState.value.connectionState == TunnelConnectionState.CONNECTED
         ) return
-        pushDefaultTunnel(conf, id)
         refreshUiRows()
         if (vpnState.value.connectionState == TunnelConnectionState.CONNECTED ||
             vpnState.value.connectionState == TunnelConnectionState.CONNECTING
         ) {
+            // Switching manual while connected: one verified 5s attempt
+            // on the new manual (v1.64); on failure, the published walk,
+            // skipping manual — never a birth wake on one endpoint.
             viewModelScope.launch {
                 try { manager.stopTunnel() } catch (_: Exception) {}
-                connectTo(id, conf)
+                if (!connectTo(id, conf)) {
+                    if (!connectWalk(
+                            conf, excludeId = id,
+                            startId = publishedWalkList().firstOrNull()?.id
+                        )
+                    ) {
+                        walkExhausted = true
+                        VpnForegroundService.stopQuiet(app)
+                        message("No endpoint connected")
+                    }
+                }
             }
         } else {
             _ui.update { it.copy(currentMs = msFor(id)) }
@@ -1446,7 +1413,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             store.feedRestartPending = true
         }
         refreshUiRows()
-        if (isNew && walkExhausted && !manager.isUserOverride()) {
+        if (isNew && (walkExhausted || manager.isAutoWalkExhausted()) &&
+            !manager.isUserOverride()
+        ) {
             val conf = store.baseConf
             if (conf != null && f.endpoints.isNotEmpty()) {
                 store.feedRestartPending = false
@@ -1469,13 +1438,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     // ============================================================
     //  Helpers
     // ============================================================
-
-    private fun pushDefaultTunnel(conf: String, endpointId: String) {
-        manager.setDefaultTunnel(
-            manager.tunnelNameFor(endpointId),
-            manager.swapEndpoint(conf, endpointId)
-        )
-    }
 
     private fun msFor(id: String?): Long? {
         if (id == null) return null

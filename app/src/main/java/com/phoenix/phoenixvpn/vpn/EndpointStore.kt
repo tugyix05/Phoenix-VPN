@@ -95,6 +95,29 @@ class EndpointStore(context: Context) {
     fun effectiveList(): List<EndpointInfo> =
         cachedEndpoints.ifEmpty { BUNDLED }
 
+    /**
+     * Walk candidates (v1.64, shared by the manual and auto walks):
+     * the effective list in publisher order, minus user-deleted ids,
+     * with user edits resolved to their new "ip:port". Manual is never
+     * in this list — it lives in its own slot, not the published list.
+     */
+    fun walkList(): List<EndpointInfo> {
+        val deleted = deletedEndpoints
+        val edited = editedEndpoints
+        return effectiveList()
+            .filter { it.id !in deleted }
+            .map { e ->
+                val newId = edited[e.id]
+                if (newId != null) {
+                    val parts = newId.split(":")
+                    e.copy(
+                        ip = parts[0],
+                        port = parts.getOrNull(1)?.toIntOrNull() ?: e.port
+                    )
+                } else e
+            }
+    }
+
     private fun serialize(list: List<EndpointInfo>): String {
         val arr = JSONArray()
         for (e in list) {

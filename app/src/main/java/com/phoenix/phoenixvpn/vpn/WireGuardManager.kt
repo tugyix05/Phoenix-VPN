@@ -37,8 +37,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import com.google.firebase.crashlytics.FirebaseCrashlytics
+import com.phoenix.phoenixvpn.network.EndpointInfo
 import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.ensureActive
 
 enum class TunnelConnectionState {
     DISCONNECTED,
@@ -74,9 +77,12 @@ class WireGuardManager(private val context: Context) {
     val vpnState: StateFlow<VpnUiState> = _vpnState.asStateFlow()
 
     /**
-     * Fires when the watchdog gives up on the current endpoint (rx stalled
-     * through all re-handshakes). The UI layer fails over to the next best
-     * endpoint. Never fires while the user is driving (manual off).
+     * v1.64 (P-Tunnel flow): fires when the watchdog confirms the current
+     * endpoint is unusable — rx stalled through the grace period, or the
+     * handshake went stale after having landed. The UI layer fails over
+     * with a walk from the successor (never a same-endpoint re-draw:
+     * single-endpoint on/off looping is gone). Never fires while the
+     * user is driving (manual off).
      */
     private val _endpointDeadEvent = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     val endpointDeadEvent: SharedFlow<Unit> = _endpointDeadEvent.asSharedFlow()
@@ -139,10 +145,28 @@ class WireGuardManager(private val context: Context) {
     private var isAutoRunEnabled = false
     private var userOverride = false
 
-    // Default tunnel used by the auto-run rules: the base .conf text plus the
-    // currently selected endpoint. Pushed by the UI layer.
-    private var defaultName: String? = null
-    private var defaultConfigText: String? = null
+    // SharedPreferences-backed store (same file the UI layer uses — every
+    // property reads prefs fresh, so this instance never goes stale).
+    // The auto walk reads the base .conf and the cached list from here.
+    private val endpointStore: EndpointStore by lazy { EndpointStore(context) }
+
+    // Manager-scope auto walk (v1.64 P-Tunnel flow): runs the same
+    // two-speed walk as manual, so auto works with the app closed too.
+    private var autoWalkJob: Job? = null
+
+    // P-Tunnel rule: a walk that exhausted every candidate stays stopped
+    // until a manual ON or a new feed. Without this, the 15s periodic
+    // check would re-walk forever on a dead list.
+    @Volatile
+    private var autoWalkExhausted = false
+
+    fun isAutoWalkExhausted(): Boolean = autoWalkExhausted
+    fun setAutoWalkExhausted() { autoWalkExhausted = true }
+    fun clearAutoWalkExhausted() { autoWalkExhausted = false }
+    fun cancelAutoWalk() {
+        autoWalkJob?.cancel()
+        autoWalkJob = null
+    }
 
     // Current underlying network (not the VPN network).
     private var currentUnderlyingNetwork: Network? = null
@@ -205,12 +229,6 @@ class WireGuardManager(private val context: Context) {
     fun isUserOverride(): Boolean = userOverride
 
     fun isAutoRunEnabled(): Boolean = isAutoRunEnabled
-
-    /** Push the base .conf + selected endpoint the auto-run rules should use. */
-    fun setDefaultTunnel(name: String?, configText: String?) {
-        defaultName = name
-        defaultConfigText = configText
-    }
 
     /** Notification "ရပ်ရန်": manual-off semantics — override sticks, tunnel down. */
     fun handleNotificationStop() {
@@ -281,6 +299,12 @@ class WireGuardManager(private val context: Context) {
      * manual-off stops the service entirely.
      */
     suspend fun stopTunnel(keepService: Boolean = false) = withContext(Dispatchers.IO) {
+        // A stop always wins over a manager auto walk — including the
+        // between-attempts gap, where currentTunnel is already null.
+        // (The manual walk runs in the caller's scope, not autoWalkJob,
+        // so it is unaffected.)
+        autoWalkJob?.cancel()
+        autoWalkJob = null
         val tunnel = currentTunnel ?: return@withContext
         try {
             _vpnState.update { it.copy(connectionState = TunnelConnectionState.DISCONNECTING) }
@@ -524,6 +548,108 @@ class WireGuardManager(private val context: Context) {
     }
 
     /**
+     * v1.64 two-speed walk (P-Tunnel flow, shared by manual and auto):
+     * candidates = the full cached list in publisher order (bundled trio
+     * only if no feed), minus user-deleted, edits resolved. Pass 1 runs
+     * from [startId] (else the stored last-connected, else #1) to the
+     * end with the QUICK timeout; pass 2 runs the full list once more
+     * with the FULL timeout, so a slow-landing endpoint cut short in
+     * pass 1 still gets its full window. Per candidate exactly 1
+     * attempt; the first handshake wins and becomes the new
+     * last-connected. A pending new feed starts the walk at the feed's
+     * #1 (flag cleared here) unless the caller already consumed it.
+     * Returns the winner, or null when both passes found nothing.
+     * Never loops on one endpoint: a failed candidate is left behind
+     * at once — no same-endpoint DOWN→UP re-rolls anywhere in this
+     * file anymore. [onCandidate] reports each attempt to the caller
+     * (the manual walk uses it for its "Connecting… <id>" line).
+     */
+    suspend fun walkEndpoints(
+        conf: String,
+        startId: String?,
+        excludeId: String?,
+        onCandidate: ((EndpointInfo) -> Unit)? = null
+    ): EndpointInfo? {
+        val published = endpointStore.walkList()
+        if (published.isEmpty()) return null
+        val start = when {
+            endpointStore.feedRestartPending -> {
+                endpointStore.feedRestartPending = false
+                published.first().id
+            }
+            startId != null && published.any { it.id == startId } -> startId
+            else -> endpointStore.currentEndpoint?.takeIf { id ->
+                published.any { it.id == id }
+            } ?: published.first().id
+        }
+        val startIdx = published.indexOfFirst { it.id == start }
+        val pass1 = if (startIdx >= 0) published.subList(startIdx, published.size) else published
+        val passes = listOf(pass1 to WALK_TIMEOUT_QUICK_MS, published to WALK_TIMEOUT_MS)
+        for ((pass, timeoutMs) in passes) {
+            for (e in pass) {
+                currentCoroutineContext().ensureActive()
+                if (e.id == excludeId) continue
+                onCandidate?.invoke(e)
+                val cfg = swapEndpoint(conf, e.id)
+                val ok = try {
+                    startTunnelAndAwaitHandshake(tunnelNameFor(e.id), cfg, timeoutMs)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Exception) {
+                    false
+                }
+                if (ok) {
+                    endpointStore.currentEndpoint = e.id
+                    if (endpointStore.explicitEndpoint != null &&
+                        endpointStore.explicitEndpoint != endpointStore.manualEndpoint
+                    ) {
+                        endpointStore.explicitEndpoint = null
+                    }
+                    return e
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * v1.64 auto-connect entry point (P-Tunnel flow): the auto-run rules
+     * no longer start one default endpoint and re-roll it forever — they
+     * run the same two-speed walk as manual, in manager scope, so auto
+     * works with the app closed too. Guards: auto must be on, no user
+     * override, no walk already running, nothing connected/connecting,
+     * VPN permission granted (without it every attempt would fail and
+     * burn the walk into exhaustion — skip silently and retry later),
+     * and a base .conf must exist. On exhaustion the flag sticks until
+     * a manual ON or a new feed clears it.
+     */
+    fun requestAutoWalk() {
+        if (!isAutoRunEnabled || userOverride) return
+        if (autoWalkExhausted) return
+        if (autoWalkJob?.isActive == true) return
+        val state = _vpnState.value.connectionState
+        if (state == TunnelConnectionState.CONNECTED ||
+            state == TunnelConnectionState.CONNECTING
+        ) return
+        if (checkVpnPermission() != null) return
+        val conf = endpointStore.baseConf ?: return
+        autoWalkJob = scope.launch(Dispatchers.IO) {
+            try {
+                if (walkEndpoints(conf, startId = null, excludeId = null) != null) {
+                    autoWalkExhausted = false
+                } else {
+                    autoWalkExhausted = true
+                }
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (e: Exception) {
+                Log.e(TAG, "Auto walk failed", e)
+                autoWalkExhausted = true
+            }
+        }
+    }
+
+    /**
      * Stuck watchdog reporter (v1.26): a connect attempt still inside after
      * [STUCK_WATCHDOG_MS] is wedged at the native level (no Kotlin timeout
      * can interrupt it). Records a non-fatal to Crashlytics with the recent
@@ -691,7 +817,6 @@ class WireGuardManager(private val context: Context) {
                 delay(3000)
             }
         }
-        startBirthWake(tunnel)
     }
 
     /** Newest peer handshake time (epoch ms) in [stats]; 0 when none landed. */
@@ -714,159 +839,18 @@ class WireGuardManager(private val context: Context) {
     private fun stopStatsPolling() {
         statsJob?.cancel()
         statsJob = null
-        wakeJob?.cancel()
-        wakeJob = null
-        stallWakeJob?.cancel()
-        stallWakeJob = null
     }
 
-    private var wakeJob: Job? = null
-    private var stallWakeJob: Job? = null
-
-    /** Wall-clock stamp of the current flow's UP (re-stamped by the wake). */
+    /** Wall-clock stamp of the current flow's UP (set by stats polling). */
     private var tunnelUpWallMs: Long = 0L
 
-    /**
-     * Birth wake (v1.39, user spec 2026-10-24; cadence v1.40): a fresh
-     * tunnel whose handshake never lands is not a dead endpoint — it
-     * is a dead NAT flow, and retransmits on that flow never recover;
-     * only a full restart draws a new one (the user's manual off/on
-     * toggle, automated). The UI keeps its fire-and-forget "connected";
-     * behind it this loop re-draws flows — full DOWN→UP restarts,
-     * FASTER than the user's hand (his 4 WG toggles take 3s; this
-     * cycle is ~0.65s/draw: 0.25s handshake window + 0.15s wake
-     * settle + ~0.25s restart — 4 draws ≈ 2.6s), with NO cap: if 4
-     * draws don't wake it, it keeps drawing until a REAL handshake
-     * lands (user, 2026-10-24). The short wake settle can lose the
-     * delayed-onDestroy race (see lastDownAt); the loop recovers
-     * from that itself by bringing the tunnel straight back UP.
-     * ([handshakeLanded]) or data flows. It stands down the moment
-     * the tunnel is warm, when the user takes over (userOverride), or
-     * when polling stops (tunnel down / replaced). There is no
-     * give-up here and no endpoint is ever declared dead: the
-     * endpoint is alive, the flow was not. Mid-session stalls remain
-     * the watchdog's job.
-     */
-    private fun startBirthWake(tunnel: PhoenixTunnel) {
-        wakeJob?.cancel()
-        wakeJob = scope.launch(Dispatchers.IO) {
-            var stage = 0
-            while (isActive) {
-                delay(250L)
-                if (userOverride) return@launch
-                if (currentTunnel !== tunnel) return@launch
-                val stats = try {
-                    backend.getStatistics(tunnel)
-                } catch (_: Exception) {
-                    null
-                }
-                if (stats != null &&
-                    (stats.totalRx() > 0L || handshakeLanded(stats))
-                ) {
-                    // Field-visible (Log.i survives R8; Log.d does not):
-                    // state at the moment the flow went warm — a
-                    // non-CONNECTED value here IS the UI-stale bug.
-                    Log.i(TAG, "Birth wake: warm, handshake landed, state=${_vpnState.value.connectionState}")
-                    return@launch // warm — a real handshake landed; job done
-                }
-                val config = currentConfig ?: return@launch
-                // Baseline BEFORE the restart (the await path's pattern):
-                // a handshake racing the UP counts as this flow's.
-                tunnelUpWallMs = System.currentTimeMillis()
-                if (_vpnState.value.connectionState !=
-                    TunnelConnectionState.CONNECTED
-                ) {
-                    // Race recovery: the short wake settle can lose to
-                    // GoBackend's delayed VpnService.onDestroy, which
-                    // kills a fresh UP. Bring it straight back UP
-                    // (a fresh flow) instead of stalling.
-                    try {
-                        setBackendState(
-                            tunnel, Tunnel.State.UP, config, WAKE_SETTLE_MS
-                        )
-                    } catch (_: Exception) {
-                    }
-                    stage++
-                    continue
-                }
-                try {
-                    setBackendState(tunnel, Tunnel.State.DOWN, null)
-                    setBackendState(
-                        tunnel, Tunnel.State.UP, config, WAKE_SETTLE_MS
-                    )
-                    Log.i(TAG, "Birth wake: no handshake yet — flow re-roll ${stage + 1}")
-                } catch (_: Exception) {
-                }
-                stage++
-            }
-        }
-    }
-
-    /**
-     * Mid-session stall wake (v1.48, user spec 2026-10-24): the user's hand
-     * toggles when the LINE dies — one DOWN→UP, same endpoint, and the
-     * handshake is back (about 4 wakes when the flow goes cool). This is
-     * that toggle, automated: entered only on a 12s-confirmed stall
-     * (rx stalled, tx growing — the user is actively trying), it draws
-     * rapid DOWN→UP flows (~0.65s/draw, birth cadence) until a FRESH
-     * handshake lands on the new flow or rx flows again. No cap, no
-     * endpoint switch: the endpoint never dies, only flows do. Idle
-     * lines never enter (tx flat); user override always wins. On warm
-     * exit the stall baseline re-arms (12s grace) so a handshake-fresh
-     * but still data-dead line re-enters cleanly instead of hot-looping.
-     */
-    private fun startStallWake(tunnel: PhoenixTunnel) {
-        if (stallWakeJob?.isActive == true) return
-        Log.i(TAG, "Stall wake: started")
-        stallWakeJob = scope.launch(Dispatchers.IO) {
-            val wakeStartMs = System.currentTimeMillis()
-            val startRx = try {
-                backend.getStatistics(tunnel)?.totalRx() ?: lastRxBytes
-            } catch (_: Exception) {
-                lastRxBytes
-            }
-            while (isActive) {
-                delay(250L)
-                if (userOverride) return@launch
-                if (currentTunnel !== tunnel) return@launch
-                val stats = try {
-                    backend.getStatistics(tunnel)
-                } catch (_: Exception) {
-                    null
-                }
-                // Warm again: rx flowing, or a fresh handshake on a flow
-                // drawn AFTER entry (tunnelUpWallMs > wakeStartMs guards
-                // the old flow's handshake from passing as fresh).
-                if (stats != null && (stats.totalRx() > startRx ||
-                    (tunnelUpWallMs > wakeStartMs && handshakeLanded(stats)))
-                ) {
-                    lastRxProgressAt = System.currentTimeMillis()
-                    Log.i(TAG, "Stall wake: warm again, state=${_vpnState.value.connectionState}")
-                    return@launch
-                }
-                val config = currentConfig ?: return@launch
-                tunnelUpWallMs = System.currentTimeMillis()
-                try {
-                    setBackendState(tunnel, Tunnel.State.DOWN, null)
-                    setBackendState(
-                        tunnel, Tunnel.State.UP, config, WAKE_SETTLE_MS
-                    )
-                    Log.i(TAG, "Stall wake: still stalled — flow re-draw")
-                } catch (_: Exception) {
-                }
-            }
-        }
-    }
-
-    // ============================================================
-    //  Watchdog — mid-session stall detection (v1.48)
-    // ============================================================
-    // The user's hand toggles when the LINE dies: rx stalled while tx
-    // keeps growing (actively trying, nothing arrives). That confirmed
-    // stall starts the stall wake — rapid same-endpoint re-draws until
-    // warm. No cap, no endpoint switch: the endpoint never dies, only
-    // flows do (user 2026-10-24). A fully idle tunnel is never
-    // disturbed (tx flat), and the auto-run master switch is untouched.
+    // v1.64 (P-Tunnel flow): the birth wake (v1.39) and the stall wake
+    // (v1.48) are REMOVED — both looped DOWN→UP on a single endpoint
+    // with no cap and never switched endpoints, which the user
+    // explicitly rejected. A walk-verified connect lands its handshake
+    // before CONNECTED, so no birth phase needs owning; a confirmed
+    // mid-session stall or a stale handshake fires endpointDeadEvent
+    // and the UI layer fails over with a walk from the successor.
 
     private var lastRxBytes: Long = -1L
     private var lastTxBytes: Long = -1L
@@ -882,31 +866,32 @@ class WireGuardManager(private val context: Context) {
             return
         }
         // Birth phase: a tunnel that has never received anything is not
-        // "stalled" — the birth wake owns it until the first handshake.
+        // "stalled" — walk-verified connects land their handshake before
+        // CONNECTED, so rx == 0 here just means idle, not dead.
         if (rx == 0L) return
         // rx stalled. If tx is also flat the tunnel is simply idle — leave it.
         if (tx == lastTxBytes) return
         lastTxBytes = tx
         if (userOverride) return // user is driving — don't fight them
         if (now - lastRxProgressAt < WATCHDOG_STALL_MS) return
-        // Confirmed stall: wake it like birth, on the same endpoint.
-        // No cap, no endpoint switch — the endpoint never dies.
-        val tunnel = currentTunnel ?: return
-        startStallWake(tunnel)
+        // Confirmed stall (v1.64 P-Tunnel flow): NO same-endpoint
+        // re-draw loop anymore — fire the dead-endpoint event and let
+        // the UI layer fail over with a walk from the successor.
+        Log.i(TAG, "Watchdog: confirmed stall — endpoint dead event")
+        _endpointDeadEvent.tryEmit(Unit)
     }
 
     /**
-     * Stale-handshake watchdog (v1.47): the rx-stall watchdog watches traffic
-     * counters, but WireGuard's own liveness signal is the handshake clock —
-     * after RejectAfterTime (180s) without a handshake the session keys are
-     * rejected by the protocol itself. Once a real handshake has landed in
-     * this session (birth wake owns birth), a handshake older than
-     * STALE_HANDSHAKE_MS means the flow is dead, however
-     * the counters look. Re-draw it (real DOWN→UP, same endpoint, fresh
-     * flow — the automated manual toggle). No cap: re-draws repeat every
-     * STALE_REDRAW_COOLDOWN_MS until a handshake lands, and never declare
-     * the endpoint dead — persistence on the chosen endpoint beats failover.
-     * User override (manual-off) is never fought.
+     * Stale-handshake watchdog (v1.47, v1.64 P-Tunnel flow): the rx-stall
+     * watchdog watches traffic counters, but WireGuard's own liveness
+     * signal is the handshake clock — after RejectAfterTime (180s)
+     * without a handshake the session keys are rejected by the protocol
+     * itself. Once a real handshake has landed in this session, a
+     * handshake older than STALE_HANDSHAKE_MS means the endpoint is
+     * unusable — and v1.64 no longer re-draws it on the same endpoint.
+     * It fires the dead-endpoint event instead, so the UI layer fails
+     * over with a walk from the successor. The cooldown only spaces
+     * repeat events. User override (manual-off) is never fought.
      */
     private suspend fun staleHandshakeCheck(stats: Statistics) {
         if (!_vpnState.value.handshakeLive) return
@@ -918,16 +903,9 @@ class WireGuardManager(private val context: Context) {
         val now = System.currentTimeMillis()
         if (now - hs < STALE_HANDSHAKE_MS) return
         if (now - lastStaleRedrawAt < STALE_REDRAW_COOLDOWN_MS) return
-        val tunnel = currentTunnel ?: return
-        val config = currentConfig ?: return
         lastStaleRedrawAt = now
-        try {
-            setBackendState(tunnel, Tunnel.State.DOWN, null)
-            setBackendState(tunnel, Tunnel.State.UP, config)
-            Log.i(TAG, "Watchdog: handshake stale ${STALE_HANDSHAKE_MS}ms — flow re-draw (auto-toggle)")
-        } catch (e: Exception) {
-            Log.e(TAG, "Watchdog stale re-draw failed", e)
-        }
+        Log.i(TAG, "Watchdog: handshake stale ${STALE_HANDSHAKE_MS}ms — endpoint dead event")
+        _endpointDeadEvent.tryEmit(Unit)
     }
 
     // ============================================================
@@ -1123,19 +1101,11 @@ class WireGuardManager(private val context: Context) {
         }
 
         // ----- Rule 3: Auto-connect on Wi-Fi / Mobile data -----
-        if ((isWifi || isCellular) &&
-            _vpnState.value.connectionState != TunnelConnectionState.CONNECTED &&
-            _vpnState.value.connectionState != TunnelConnectionState.CONNECTING
-        ) {
-            val name = defaultName
-            val configText = defaultConfigText
-            if (name != null && configText != null) {
-                Log.d(TAG, "Auto-connecting via ${if (isWifi) "Wi-Fi" else "Mobile Data"}")
-                userOverride = false
-                startTunnel(name, configText)
-            } else {
-                Log.d(TAG, "No default tunnel set → skip auto-connect")
-            }
+        // v1.64 P-Tunnel flow: the SAME two-speed walk as manual, in
+        // manager scope (requestAutoWalk carries the guards). No more
+        // single-default-endpoint start + birth wake.
+        if (isWifi || isCellular) {
+            requestAutoWalk()
         }
     }
 
@@ -1223,13 +1193,14 @@ class WireGuardManager(private val context: Context) {
          */
         private const val DOWN_UP_SETTLE_MS = 500L
         /**
-         * Birth-wake settle (v1.45): the wake cycles faster than a
-         * human hand, so it cannot wait out the full 500ms settle.
-         * 150ms covers the fast path; if the delayed-onDestroy race
-         * still kills a wake UP, the wake's recovery branch brings the
-         * tunnel straight back UP instead of stalling.
+         * v1.64 two-speed walk timeouts (P-Tunnel flow): pass 1 steps
+         * over failures fast (field evidence: connecting endpoints land
+         * immediately, failing ones never land even in 5s); pass 2 keeps
+         * the full window so a slow lander cut short in pass 1 still
+         * gets its full chance before the walk gives up.
          */
-        private const val WAKE_SETTLE_MS = 150L
+        private const val WALK_TIMEOUT_QUICK_MS = 2_000L
+        private const val WALK_TIMEOUT_MS = 5_000L
         /**
          * Hard backstop for backend.setState(): converts a wedged backend
          * into a clean attempt failure instead of a forever-"connecting" UI.
