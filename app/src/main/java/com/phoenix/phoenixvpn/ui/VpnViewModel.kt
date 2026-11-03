@@ -375,6 +375,22 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     if (_ui.value.connectedAt == 0L) {
                         _ui.update { it.copy(connectedAt = SystemClock.elapsedRealtime()) }
                     }
+                    // Pill must show the LIVE endpoint (user 2026-11-03):
+                    // manager-scope auto walks never touch the UI, so
+                    // without this the pill keeps the pre-walk stored
+                    // selection while the tunnel is on the walk winner.
+                    // The manager updates the store on every win, so
+                    // re-reading it here adopts the winner. Runs on
+                    // every CONNECTED emission, so a store-set race on
+                    // the first emission self-corrects on the next tick.
+                    refreshUiRows()
+                    // Same gap, failover side: the auto path never sets
+                    // tunnelEndpointId, so after an auto win it stays
+                    // stale from an earlier manual connect and would
+                    // misdirect failover's exclude/successor. Sync it
+                    // from the same freshly-read current id, so pill,
+                    // failover and live tunnel all agree.
+                    tunnelEndpointId = _ui.value.currentId
                     startTicker()
                 } else {
                     stopTicker()
