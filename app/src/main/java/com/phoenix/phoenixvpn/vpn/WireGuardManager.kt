@@ -41,6 +41,7 @@ import com.phoenix.phoenixvpn.network.EndpointInfo
 import java.io.ByteArrayInputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
 enum class TunnelConnectionState {
