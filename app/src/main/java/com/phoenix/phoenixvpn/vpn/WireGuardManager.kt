@@ -127,6 +127,7 @@ class WireGuardManager(private val context: Context) {
 
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var vpnNetworkCallback: ConnectivityManager.NetworkCallback? = null
 
     /**
      * Serializes every backend.setState() call. GoBackend keeps its tunnel
@@ -1045,6 +1046,22 @@ class WireGuardManager(private val context: Context) {
             }
             networkCallback = callback
             cm.registerNetworkCallback(request, callback)
+
+            // v1.68 revoke watch: a second callback that watches the VPN
+            // network itself. The underlying-network callback above
+            // explicitly excludes VPN (NET_CAPABILITY_NOT_VPN), so it can
+            // never see a revoke. When another VPN takes over, Android
+            // destroys our VPN network and this callback's onLost fires.
+            val vpnRequest = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                .build()
+            val vpnCallback = object : ConnectivityManager.NetworkCallback() {
+                override fun onLost(network: Network) {
+                    onVpnNetworkLost()
+                }
+            }
+            vpnNetworkCallback = vpnCallback
+            cm.registerNetworkCallback(vpnRequest, vpnCallback)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register network callback", e)
         }
@@ -1055,10 +1072,14 @@ class WireGuardManager(private val context: Context) {
             networkCallback?.let { callback ->
                 connectivityManager?.unregisterNetworkCallback(callback)
             }
+            vpnNetworkCallback?.let { callback ->
+                connectivityManager?.unregisterNetworkCallback(callback)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to unregister", e)
         } finally {
             networkCallback = null
+            vpnNetworkCallback = null
             connectivityManager = null
         }
     }
@@ -1074,6 +1095,31 @@ class WireGuardManager(private val context: Context) {
     private fun onNetworkLost() {
         _networkLostEvent.tryEmit(Unit)
         scheduleRulesCheck(delayMs = 1000L)
+    }
+
+    /**
+     * Revoke path (v1.68): the VPN network disappearing while we are
+     * CONNECTED means Android revoked our tunnel — another VPN took over.
+     * Why this callback, not onRevoke: the tunnel is owned by the
+     * library's GoBackend$VpnService, which has NO onRevoke override
+     * (wireguard-android 1.0.20230706, source-verified) — the Android
+     * default just calls stopSelf(), and its onDestroy→onStateChange(DOWN)
+     * propagation evidently does not reach the UI (field: stays
+     * Connected). So observe the OS network directly instead of depending
+     * on the library's service lifecycle. Treated like a manual off:
+     * userOverride sticks, so Auto ON never re-walks and steals the
+     * tunnel back from the other VPN. CONNECTED-only guard: our own
+     * disconnect already moves the state to DISCONNECTING/DISCONNECTED
+     * before the network teardown arrives, and a mid-connect revoke is
+     * left to the connect flow (no race with startTunnel).
+     */
+    private fun onVpnNetworkLost() {
+        if (_vpnState.value.connectionState != TunnelConnectionState.CONNECTED) return
+        Log.i(TAG, "VPN network lost while connected — revoked by another VPN, disconnecting")
+        userOverride = true
+        scope.launch(Dispatchers.IO) {
+            stopTunnel(keepService = false)
+        }
     }
 
     /**
