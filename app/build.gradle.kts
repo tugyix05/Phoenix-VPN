@@ -13,8 +13,8 @@ android {
         applicationId = "com.phoenix.phoenixvpn"
         minSdk = 24
         targetSdk = 36
-        versionCode = 69
-        versionName = "1.68"
+        versionCode = 70
+        versionName = "1.69"
     }
 
     signingConfigs {

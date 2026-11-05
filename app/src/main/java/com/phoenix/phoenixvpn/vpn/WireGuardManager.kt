@@ -798,6 +798,7 @@ class WireGuardManager(private val context: Context) {
         lastTxBytes = -1L
         lastRxProgressAt = System.currentTimeMillis()
         lastStaleRedrawAt = 0L
+        deadStatsPolls = 0
         // Live-PING fix (2026-11-01, v1.62 walk regression): the walk's
         // startTunnelAndAwaitHandshake already measured the real
         // handshake latency in lastHandshakeMs, but the old code below
@@ -856,6 +857,31 @@ class WireGuardManager(private val context: Context) {
                                 }
                             )
                         }
+                        // Dead-tunnel detector (v1.69, UI fix): after a
+                        // revoke the Go backend has NO peer at all
+                        // (wgTurnOff ran), so stats carry no handshake
+                        // epoch — while a live tunnel always keeps its
+                        // peer entry. The existing watchdogs deliberately
+                        // skip empty stats (staleHandshakeCheck returns
+                        // on hs <= 0), so a silently dead tunnel left
+                        // the UI stranded on CONNECTED forever. Only
+                        // when this session already had a live handshake
+                        // (connect-time has none yet) and the state is
+                        // CONNECTED, count consecutive empty polls; 2 in
+                        // a row (~6s) rules out the sub-second DOWN→UP
+                        // rebind gap.
+                        val uiState = _vpnState.value
+                        if (uiState.connectionState == TunnelConnectionState.CONNECTED &&
+                            uiState.handshakeLive &&
+                            latestHandshakeEpoch(stats) == 0L
+                        ) {
+                            if (++deadStatsPolls >= DEAD_STATS_POLLS) {
+                                handleDeadTunnelDetected()
+                                return@launch
+                            }
+                        } else {
+                            deadStatsPolls = 0
+                        }
                         watchdogCheck(rx, tx)
                         staleHandshakeCheck(stats)
                     }
@@ -902,6 +928,9 @@ class WireGuardManager(private val context: Context) {
     private var lastTxBytes: Long = -1L
     private var lastRxProgressAt: Long = 0L
     private var lastStaleRedrawAt: Long = 0L
+    // Dead-tunnel detector (v1.69): consecutive empty-stats polls after
+    // this session had a live handshake.
+    private var deadStatsPolls: Int = 0
 
     private suspend fun watchdogCheck(rx: Long, tx: Long) {
         val now = System.currentTimeMillis()
@@ -1123,6 +1152,21 @@ class WireGuardManager(private val context: Context) {
     }
 
     /**
+     * Dead-tunnel path (v1.69, UI fix): the stats loop found the backend
+     * has no live tunnel for us even though this session handshook —
+     * the tunnel died silently (e.g. revoked by another VPN) without
+     * any DOWN signal reaching the UI. Same treatment as a lost VPN
+     * network: userOverride sticks so Auto never re-walks and steals
+     * the tunnel back, then stop. The v1.68 onLost handler stays as
+     * the fast path; this is the self-healing fallback.
+     */
+    private suspend fun handleDeadTunnelDetected() {
+        Log.i(TAG, "Dead tunnel detected (stats empty after live handshake) — disconnecting UI")
+        userOverride = true
+        stopTunnel(keepService = false)
+    }
+
+    /**
      * Internet-GAINED path: fired when NET_CAPABILITY_VALIDATED newly appears
      * on the underlying (non-VPN) network. No 3s debounce — the rules run
      * promptly (≤500ms) so auto-reconnect lands within 2–3s of the OS
@@ -1277,6 +1321,13 @@ class WireGuardManager(private val context: Context) {
         private const val STALE_HANDSHAKE_MS = 180_000L
         /** Minimum gap between stale re-draws (the new flow's proving time). */
         private const val STALE_REDRAW_COOLDOWN_MS = 30_000L
+        /**
+         * Dead-tunnel detector (v1.69): consecutive stats polls with no
+         * peer handshake at all before the UI is forced to DISCONNECTED.
+         * 2 polls ≈ 6s — far longer than the sub-second DOWN→UP rebind
+         * gap, so a transient empty read can never trip it.
+         */
+        private const val DEAD_STATS_POLLS = 2
         /**
          * DOWN→UP settle: lets a torn-down VpnService's delayed onDestroy()
          * finish before the next establish(), so it can't kill the fresh
