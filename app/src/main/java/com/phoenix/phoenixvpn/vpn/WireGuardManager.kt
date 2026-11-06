@@ -1163,7 +1163,15 @@ class WireGuardManager(private val context: Context) {
     private suspend fun handleDeadTunnelDetected() {
         Log.i(TAG, "Dead tunnel detected (stats empty after live handshake) — disconnecting UI")
         userOverride = true
-        stopTunnel(keepService = false)
+        // v1.70: do NOT call stopTunnel() inline here — this runs inside
+        // the stats-poller coroutine, and stopTunnel() cancels that very
+        // job (stopStatsPolling) before reaching setState(DOWN), so the
+        // DOWN call throws CancellationException ("b20 was cancelled")
+        // and the catch turns it into ERROR while the VPN slot stays
+        // held. Dispatch the stop to a fresh coroutine on the manager
+        // scope instead: the new job is a sibling, so cancelling the
+        // stats job can't kill it and setState(DOWN) runs normally.
+        scope.launch(Dispatchers.IO) { stopTunnel(keepService = false) }
     }
 
     /**
