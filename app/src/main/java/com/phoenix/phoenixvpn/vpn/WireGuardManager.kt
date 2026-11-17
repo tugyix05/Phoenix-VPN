@@ -159,8 +159,12 @@ class WireGuardManager(private val context: Context) {
     // The auto walk reads the base .conf and the cached list from here.
     private val endpointStore: EndpointStore by lazy { EndpointStore(context) }
 
-    // Manager-scope auto walk (v1.64 P-Tunnel flow): runs the same
-    // two-speed walk as manual, so auto works with the app closed too.
+    // Raw-UDP handshake prober (v1.72 parallel walk): probes without
+    // touching the backend, so all candidates can be tried at once.
+    private val prober = WgProber()
+
+    // Manager-scope auto walk (v1.72 parallel walk): runs the same
+    // probe-first walk as manual, so auto works with the app closed too.
     private var autoWalkJob: Job? = null
 
     // P-Tunnel rule: a walk that exhausted every candidate stays stopped
@@ -557,23 +561,36 @@ class WireGuardManager(private val context: Context) {
     }
 
     /**
-     * v1.64 two-speed walk (P-Tunnel flow, shared by manual and auto):
-     * candidates = the full cached list in publisher order (bundled trio
-     * only if no feed), minus user-deleted, edits resolved. Pass 1 runs
-     * from [startId] (else the stored last-connected, else #1) to the
-     * end with the QUICK timeout; pass 2 runs the full list once more
-     * with the FULL timeout, so a slow-landing endpoint cut short in
-     * pass 1 still gets its full window. Per candidate exactly 1
-     * attempt; the first handshake wins and becomes the new
-     * last-connected. A pending new feed starts the walk at the feed's
-     * #1 (flag cleared here) unless the caller already consumed it.
-     * Returns the winner, or null when both passes found nothing.
-     * Never loops on one endpoint: a failed candidate is left behind
-     * at once — no same-endpoint DOWN→UP re-rolls anywhere in this
-     * file anymore. [onCandidate] reports each attempt to the caller
-     * (the manual walk uses it for its "Connecting… <id>" line).
-     * [walkCandidate] mirrors the same attempt for the UI, so auto
-     * walks (no onCandidate) show their current candidate too.
+     * v1.72 parallel probe-first walk (first-wins, shared by manual and
+     * auto — replaces the v1.64 two-speed sequential walk): one probe
+     * round fires a raw-UDP handshake initiation at EVERY candidate in
+     * parallel (fresh socket per endpoint = fresh flow/draw each round),
+     * and the first response wins. The winner then gets ONE real tunnel
+     * attempt ([startTunnelAndAwaitHandshake], 5s); if that fails, the
+     * next responder (in response order) is tried. If a round finds no
+     * responder within [PROBE_ROUND_TIMEOUT_MS], ALL candidates are
+     * re-rolled with fresh sockets. The walk gives up after
+     * [MAX_PROBE_ROUNDS] rounds with no winner and returns null
+     * (exhaustion — never an endpoint-death verdict; a later manual ON
+     * or new feed retries). Candidates = the full cached list in
+     * publisher order (bundled trio only if no feed), minus
+     * user-deleted, edits resolved, minus [excludeId] (manual is never
+     * in the list). A pending new feed only clears its flag here —
+     * start position is moot when every candidate is probed in
+     * parallel, so [startId] is accepted for call-site compatibility
+     * but no longer orders anything. The first handshake wins and
+     * becomes the new last-connected.
+     * [onCandidate] reports the winner being tunnel-attempted (the
+     * manual walk uses it for its "Connecting… <id>" line).
+     * [walkCandidate] mirrors the same winner for the UI, so auto
+     * walks (no onCandidate) show it too.
+     * Why probe-first: the attempt primitive is a full GoBackend tunnel
+     * start (VpnService, one tunnel at a time, backend mutex + DOWN/UP
+     * settle) — parallel tunnel starts would serialize and churn, so
+     * the parallel part is raw-UDP probes only, and exactly ONE tunnel
+     * is ever started. A late probe response can never switch the
+     * tunnel: responders are only read inside the round, and the tunnel
+     * is started only for the chosen winner.
      */
     suspend fun walkEndpoints(
         conf: String,
@@ -583,44 +600,49 @@ class WireGuardManager(private val context: Context) {
     ): EndpointInfo? {
         val published = endpointStore.walkList()
         if (published.isEmpty()) return null
-        val start = when {
-            endpointStore.feedRestartPending -> {
-                endpointStore.feedRestartPending = false
-                published.first().id
-            }
-            startId != null && published.any { it.id == startId } -> startId
-            else -> endpointStore.currentEndpoint?.takeIf { id ->
-                published.any { it.id == id }
-            } ?: published.first().id
+        // Consume the pending-feed flag (kept from the sequential walk):
+        // the flag must not linger, even though start position is moot
+        // when every candidate is probed in parallel.
+        if (endpointStore.feedRestartPending) {
+            endpointStore.feedRestartPending = false
         }
-        val startIdx = published.indexOfFirst { it.id == start }
-        val pass1 = if (startIdx >= 0) published.subList(startIdx, published.size) else published
-        val passes = listOf(pass1 to WALK_TIMEOUT_QUICK_MS, published to WALK_TIMEOUT_MS)
+        val candidates = published.filter { it.id != excludeId }
+        if (candidates.isEmpty()) return null
         try {
-            for ((pass, timeoutMs) in passes) {
-                for (e in pass) {
+            repeat(MAX_PROBE_ROUNDS) { round ->
+                currentCoroutineContext().ensureActive()
+                val responders = prober.probeRound(
+                    candidates, PROBE_ROUND_TIMEOUT_MS, PROBE_RESPONDER_GRACE_MS
+                )
+                for (winner in responders) {
                     currentCoroutineContext().ensureActive()
-                    if (e.id == excludeId) continue
-                    onCandidate?.invoke(e)
-                    _walkCandidate.value = e
-                    val cfg = swapEndpoint(conf, e.id)
+                    onCandidate?.invoke(winner)
+                    _walkCandidate.value = winner
+                    val cfg = swapEndpoint(conf, winner.id)
                     val ok = try {
-                        startTunnelAndAwaitHandshake(tunnelNameFor(e.id), cfg, timeoutMs)
+                        startTunnelAndAwaitHandshake(
+                            tunnelNameFor(winner.id), cfg, WALK_TIMEOUT_MS
+                        )
                     } catch (ce: CancellationException) {
                         throw ce
                     } catch (_: Exception) {
                         false
                     }
                     if (ok) {
-                        endpointStore.currentEndpoint = e.id
+                        endpointStore.currentEndpoint = winner.id
                         if (endpointStore.explicitEndpoint != null &&
                             endpointStore.explicitEndpoint != endpointStore.manualEndpoint
                         ) {
                             endpointStore.explicitEndpoint = null
                         }
-                        return e
+                        return winner
                     }
+                    // Tunnel start failed for this responder (fresh draw)
+                    // — try the next responder in response order.
                 }
+                // No responder, or every responder's tunnel start failed:
+                // re-roll ALL candidates with fresh sockets next round.
+                Log.i(TAG, "Walk round ${round + 1}: no winner — re-rolling")
             }
             return null
         } finally {
@@ -629,10 +651,10 @@ class WireGuardManager(private val context: Context) {
     }
 
     /**
-     * v1.64 auto-connect entry point (P-Tunnel flow): the auto-run rules
-     * no longer start one default endpoint and re-roll it forever — they
-     * run the same two-speed walk as manual, in manager scope, so auto
-     * works with the app closed too. Guards: auto must be on, no user
+     * v1.72 auto-connect entry point (parallel probe-first walk): the
+     * auto-run rules no longer start one default endpoint and re-roll
+     * it forever — they run the same parallel walk as manual, in
+     * manager scope, so auto works with the app closed too. Guards: auto must be on, no user
      * override, no walk already running, nothing connected/connecting,
      * VPN permission granted (without it every attempt would fail and
      * burn the walk into exhaustion — skip silently and retry later),
@@ -1244,7 +1266,7 @@ class WireGuardManager(private val context: Context) {
         }
 
         // ----- Rule 3: Auto-connect on Wi-Fi / Mobile data -----
-        // v1.64 P-Tunnel flow: the SAME two-speed walk as manual, in
+        // v1.72 parallel walk: the SAME probe-first walk as manual, in
         // manager scope (requestAutoWalk carries the guards). No more
         // single-default-endpoint start + birth wake.
         if (isWifi || isCellular) {
@@ -1343,14 +1365,17 @@ class WireGuardManager(private val context: Context) {
          */
         private const val DOWN_UP_SETTLE_MS = 500L
         /**
-         * v1.64 two-speed walk timeouts (P-Tunnel flow): pass 1 steps
-         * over failures fast (field evidence: connecting endpoints land
-         * immediately, failing ones never land even in 5s); pass 2 keeps
-         * the full window so a slow lander cut short in pass 1 still
-         * gets its full chance before the walk gives up.
+         * v1.72 parallel walk timeouts: each responder's tunnel attempt
+         * keeps the full 5s window (a proven responder deserves the
+         * same chance a pass-2 candidate had); the probe round waits
+         * 2s for the first response plus a 300ms grace for extra
+         * responders, and re-rolls up to 3 empty rounds before the
+         * walk gives up (exhaustion, never an endpoint-death verdict).
          */
-        private const val WALK_TIMEOUT_QUICK_MS = 2_000L
         private const val WALK_TIMEOUT_MS = 5_000L
+        private const val PROBE_ROUND_TIMEOUT_MS = 2_000L
+        private const val PROBE_RESPONDER_GRACE_MS = 300L
+        private const val MAX_PROBE_ROUNDS = 3
         /**
          * Hard backstop for backend.setState(): converts a wedged backend
          * into a clean attempt failure instead of a forever-"connecting" UI.

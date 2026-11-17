@@ -312,8 +312,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     private var tunnelEndpointId: String? = null
 
     /**
-     * v1.62: true after a walk exhausted every candidate (pass 2 done,
-     * no handshake). The hero then shows "No endpoint connected" and
+     * v1.62: true after a walk exhausted every candidate (all probe
+     * rounds done, no handshake). The hero then shows "No endpoint
      * the app stays stopped — until a manual ON, or a new feed, which
      * auto-walks the new list at once. Not persisted: a process
      * restart falls back to the persisted feed-pending flag instead.
@@ -516,14 +516,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Tap-to-connect flow (v1.62 walk, v1.64 two-speed):
+     * Tap-to-connect flow (v1.72 parallel probe-first walk):
      *   internet → VPN permission → fetch .conf (if missing) →
-     *   flat walk over the full cached list (publisher order, bundled
-     *   trio only if no feed): start at last-connected, else #1 —
-     *   unless a new feed is pending, in which case this manual ON is
-     *   the feed trigger and the walk starts at the new feed's #1.
-     *   Per candidate 1 attempt; pass 1 waits 2s, pass 2 waits 5s;
-     *   first handshake wins and becomes the new last-connected.
+     *   parallel walk over the full cached list (publisher order,
+     *   bundled trio only if no feed): every candidate is probed at
+     *   once with a raw-UDP handshake, first response wins and gets
+     *   the one real tunnel attempt; the winner becomes the new
+     *   last-connected. A pending new feed still clears its flag
+     *   here, but start position is moot in parallel.
      *   Tap never waits on — or triggers — an endpoints fetch.
      * Any step may abort back to disconnected with a toast reason.
      */
@@ -654,15 +654,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * v1.64 walk: thin UI wrapper over the manager's shared two-speed
-     * walk (pass 1 = 2s/ep, pass 2 = 5s/ep — same walk the auto path
-     * runs). The manager owns candidates, attempts and the
-     * last-connected store; this wrapper only mirrors the win into
-     * the UI and tracks exhaustion. Returns false only when both
-     * passes found nothing. A failed walk also arms the manager's
-     * auto-exhaustion flag, so auto-run does not immediately re-walk
-     * a dead list (P-Tunnel rule: stay stopped until manual ON or a
-     * new feed).
+     * v1.72 walk: thin UI wrapper over the manager's shared parallel
+     * probe-first walk (same walk the auto path runs). The manager owns
+     * candidates, attempts and the last-connected store; this wrapper
+     * only mirrors the win into the UI and tracks exhaustion. Returns
+     * false only when every probe round found nothing. A failed walk
+     * also arms the manager's auto-exhaustion flag, so auto-run does
+     * not immediately re-walk a dead list (P-Tunnel rule: stay stopped
+     * until manual ON or a new feed).
      */
     private suspend fun connectWalk(
         conf: String,
@@ -717,12 +716,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Fail over when the current endpoint dies (v1.62 walk).
      * Exclude the LIVE tunnel's endpoint, not the UI selection.
-     * Walk start: the successor of the dead endpoint in list order
-     * (pass 1 to the end, pass 2 full) — retrying the dead endpoint
-     * first would waste a 5s attempt on a known-dead destination.
-     * A dead manual endpoint has no successor in the published
-     * list, so the walk starts at the published #1, skipping manual.
-     * A pending new feed also starts at its #1 (feed trigger).
+     * The parallel walk probes every published endpoint except the
+     * dead one at once — the dead endpoint can never win a round,
+     * and a dead manual endpoint is skipped the same way (manual is
+     * never in the published list). A pending new feed still clears
+     * its flag; start position is moot in parallel.
      */
     private fun failover(reason: String) {
         if (manager.isUserOverride()) return
