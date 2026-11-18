@@ -210,7 +210,8 @@ fun HomeScreen(viewModel: VpnViewModel) {
         vpn.connectionState == TunnelConnectionState.ERROR -> HeroState.ERROR
         vpn.connectionState == TunnelConnectionState.CONNECTING ||
             vpn.connectionState == TunnelConnectionState.DISCONNECTING ||
-            ui.phase != SetupPhase.IDLE -> HeroState.WORKING
+            ui.phase != SetupPhase.IDLE ||
+            ui.connecting -> HeroState.WORKING
         else -> HeroState.IDLE
     }
 
@@ -392,7 +393,6 @@ fun HomeScreen(viewModel: VpnViewModel) {
                         .clip(RoundedCornerShape(18.dp))
                         .background(CardSurface)
                         .border(1.dp, CardBorder, RoundedCornerShape(18.dp))
-                        .clickable { viewModel.openSheet() }
                         .padding(15.dp, 16.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -422,8 +422,6 @@ fun HomeScreen(viewModel: VpnViewModel) {
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold
                     )
-                    Spacer(Modifier.width(4.dp))
-                    Text(text = "›", color = TextMuted, fontSize = 18.sp)
                 }
             }
 

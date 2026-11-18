@@ -55,6 +55,13 @@ data class EndpointRow(
 
 data class PhoenixUiState(
     val phase: SetupPhase = SetupPhase.IDLE,
+    // v1.74: connecting indicator from the tap — NOT a phase.
+    // onPowerTap cancels on non-IDLE phase, so a phase-based flag
+    // would turn a probe-round second tap into a cancel (today it is
+    // a no-op) and a CONNECTING-state tap into cancelConnectFlow
+    // (no override) instead of manualDisconnect (override sticks).
+    // This flag is display-only: only the hero derivation reads it.
+    val connecting: Boolean = false,
     val statusLine: String? = null,   // micro-progress / "new #1 available — tap to switch"
     val rows: List<EndpointRow> = emptyList(),
     val currentId: String? = null,
@@ -424,6 +431,24 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        // v1.74: mirror walk-active into the connecting flag, so the
+        // hero spins from the walk's start — this is what covers
+        // manager-scope auto walks and failover (no onCandidate there
+        // and no connectFlow). The statusLine is left to the mirror
+        // above + the "Connecting…" fallback in HomeScreen; clearing
+        // here is idempotent with connectFlow's finally (same value).
+        viewModelScope.launch {
+            manager.walkActive.collect { active ->
+                _ui.update {
+                    when {
+                        active -> it.copy(connecting = true)
+                        it.connecting -> it.copy(connecting = false)
+                        else -> it
+                    }
+                }
+            }
+        }
+
         // v1.62 feed rule, network trigger (OR with manual on/off):
         // a new feed alone never switches anything. If a feed is
         // pending when the underlying network is lost, the next walk
@@ -497,12 +522,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun cancelConnectFlow() {
         connectJob?.cancel()
-        _ui.update { it.copy(phase = SetupPhase.IDLE, statusLine = null) }
+        _ui.update { it.copy(phase = SetupPhase.IDLE, statusLine = null, connecting = false) }
     }
 
     private fun manualDisconnect() {
         connectJob?.cancel()
-        _ui.update { it.copy(phase = SetupPhase.IDLE, statusLine = null) }
+        _ui.update { it.copy(phase = SetupPhase.IDLE, statusLine = null, connecting = false) }
         // Manual-off sticks: network events must NOT clear this.
         manager.setUserOverride(true)
         viewModelScope.launch {
@@ -529,6 +554,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         manager.cancelAutoWalk()
         connectJob = viewModelScope.launch {
             try {
+                // v1.74: connecting shows from the tap, not from the
+                // first winner — set the flag before any pre-check, so
+                // the hero spins during the internet/permission/conf
+                // checks and the probe round alike.
+                _ui.update { it.copy(connecting = true, statusLine = "Connecting…") }
                 // 1. Internet first — no point asking for anything without it.
                 if (!hasValidatedInternet()) {
                     message("No internet connection")
@@ -590,9 +620,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 if (vpnState.value.connectionState != TunnelConnectionState.CONNECTED &&
                     vpnState.value.connectionState != TunnelConnectionState.CONNECTING
                 ) {
-                    _ui.update { it.copy(phase = SetupPhase.IDLE, statusLine = null) }
+                    _ui.update { it.copy(phase = SetupPhase.IDLE, statusLine = null, connecting = false) }
                 } else {
-                    _ui.update { it.copy(phase = SetupPhase.IDLE) }
+                    _ui.update { it.copy(phase = SetupPhase.IDLE, connecting = false) }
                 }
             }
         }

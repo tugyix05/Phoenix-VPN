@@ -84,6 +84,15 @@ class WireGuardManager(private val context: Context) {
     private val _walkCandidate = MutableStateFlow<EndpointInfo?>(null)
     val walkCandidate: StateFlow<EndpointInfo?> = _walkCandidate.asStateFlow()
 
+    // v1.74: whether a walk is running (manual, auto, or failover),
+    // for the immediate-connecting indicator. walkEndpoints sets this
+    // true before the probe loop and false in its finally — the UI
+    // layer mirrors it into PhoenixUiState.connecting, so the hero
+    // spins from the walk's start (probe round included), not from
+    // the first winner. Display-only signal; the walk never reads it.
+    private val _walkActive = MutableStateFlow(false)
+    val walkActive: StateFlow<Boolean> = _walkActive.asStateFlow()
+
     /**
      * v1.64 (P-Tunnel flow): fires when the watchdog confirms the current
      * endpoint is unusable — rx stalled through the grace period, or the
@@ -608,6 +617,9 @@ class WireGuardManager(private val context: Context) {
         }
         val candidates = published.filter { it.id != excludeId }
         if (candidates.isEmpty()) return null
+        // v1.74: publish walk-active BEFORE the probe loop (not on the
+        // early returns above, so an empty list never flashes it).
+        _walkActive.value = true
         try {
             repeat(MAX_PROBE_ROUNDS) { round ->
                 currentCoroutineContext().ensureActive()
@@ -647,6 +659,7 @@ class WireGuardManager(private val context: Context) {
             return null
         } finally {
             _walkCandidate.value = null
+            _walkActive.value = false
         }
     }
 
