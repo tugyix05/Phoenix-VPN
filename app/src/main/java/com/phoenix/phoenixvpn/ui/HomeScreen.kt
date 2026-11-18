@@ -12,6 +12,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -42,15 +43,12 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.PowerSettingsNew
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Snackbar
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
@@ -72,10 +70,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
@@ -279,14 +280,54 @@ fun HomeScreen(viewModel: VpnViewModel) {
             Spacer(Modifier.height(30.dp))
 
             // Hero power button with faint halo ring (mockup).
+            // v1.73: while connecting the ring spins — faint track +
+            // bright teal arc rotating 1.5s linear (mockup
+            // phoenix-connecting-mockup: dash arc over a faint track).
             Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
-                Box(
-                    modifier = Modifier
-                        .size(206.dp)
-                        .border(2.dp, Teal.copy(alpha = 0.5f), CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    HeroButton(heroState) { viewModel.onPowerTap() }
+                if (heroState == HeroState.WORKING) {
+                    val spin = rememberInfiniteTransition(label = "hero-ring-spin")
+                    val angle by spin.animateFloat(
+                        initialValue = 0f,
+                        targetValue = 360f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(1500, easing = LinearEasing)
+                        ),
+                        label = "angle"
+                    )
+                    Box(
+                        modifier = Modifier.size(206.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Canvas(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .rotate(angle)
+                        ) {
+                            // Faint full track.
+                            drawCircle(
+                                color = Teal.copy(alpha = 0.14f),
+                                style = Stroke(2.dp.toPx())
+                            )
+                            // Bright arc (~84° of the circle, as in the mockup).
+                            drawArc(
+                                color = Teal,
+                                startAngle = -90f,
+                                sweepAngle = 84f,
+                                useCenter = false,
+                                style = Stroke(2.dp.toPx(), cap = StrokeCap.Round)
+                            )
+                        }
+                        HeroButton(heroState) { viewModel.onPowerTap() }
+                    }
+                } else {
+                    Box(
+                        modifier = Modifier
+                            .size(206.dp)
+                            .border(2.dp, Teal.copy(alpha = 0.5f), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        HeroButton(heroState) { viewModel.onPowerTap() }
+                    }
                 }
             }
 
@@ -340,47 +381,50 @@ fun HomeScreen(viewModel: VpnViewModel) {
 
             Spacer(Modifier.height(22.dp))
 
-            // Endpoint chip
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 8.dp)
-                    .shadow(6.dp, RoundedCornerShape(18.dp))
-                    .clip(RoundedCornerShape(18.dp))
-                    .background(CardSurface)
-                    .border(1.dp, CardBorder, RoundedCornerShape(18.dp))
-                    .clickable { viewModel.openSheet() }
-                    .padding(15.dp, 16.dp),
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = ui.currentId ?: "—",
-                    color = TextPrimary,
-                    fontSize = 16.sp,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.weight(1f)
-                )
-                if (ui.newBestAvailable) {
+            // Endpoint chip — hidden while connecting (v1.73):
+            // no endpoint anywhere on the hero during the walk.
+            if (heroState != HeroState.WORKING) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp)
+                        .shadow(6.dp, RoundedCornerShape(18.dp))
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(CardSurface)
+                        .border(1.dp, CardBorder, RoundedCornerShape(18.dp))
+                        .clickable { viewModel.openSheet() }
+                        .padding(15.dp, 16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Text(
-                        text = "NEW",
-                        color = Color(0xFF0B0C0E),
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .background(Teal)
-                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                        text = ui.currentId ?: "—",
+                        color = TextPrimary,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.weight(1f)
                     )
-                    Spacer(Modifier.width(8.dp))
+                    if (ui.newBestAvailable) {
+                        Text(
+                            text = "NEW",
+                            color = Color(0xFF0B0C0E),
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Teal)
+                                .padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        text = ui.currentMs?.let { "$it ms" } ?: "",
+                        color = Teal,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(text = "›", color = TextMuted, fontSize = 18.sp)
                 }
-                Text(
-                    text = ui.currentMs?.let { "$it ms" } ?: "",
-                    color = Teal,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.SemiBold
-                )
-                Spacer(Modifier.width(4.dp))
-                Text(text = "›", color = TextMuted, fontSize = 18.sp)
             }
 
             // Freshness + refresh pill
@@ -577,98 +621,8 @@ fun HomeScreen(viewModel: VpnViewModel) {
                                 onTap = { viewModel.closeSheet() }
                             )
                         }
-                    },
-                    footer = {
-                        // Same display resolution as published rows.
-                        val manualMeasuring = ui.manualId != null && ui.manualId in ui.measuringIds
-                        val manualLiveMs = ui.manualId?.let { ui.liveMs[it] }
-                        val manualConnectedLive = ui.manualId != null &&
-                            ui.manualId == ui.currentId &&
-                            vpn.connectionState == TunnelConnectionState.CONNECTED &&
-                            vpn.handshakeLive && vpn.livePingMs != null
-                        val manualDisplayMs = when {
-                            manualMeasuring -> null
-                            manualConnectedLive -> vpn.livePingMs
-                            manualLiveMs != null -> manualLiveMs
-                            else -> ui.manualMs
-                        }
-                        val manualIsLive = manualConnectedLive || manualLiveMs != null
-                        val manualShowDots = manualMeasuring ||
-                            (ui.manualId != null && ui.manualId == ui.currentId &&
-                                vpn.connectionState == TunnelConnectionState.CONNECTED &&
-                                vpn.livePingMs == null)
-                        ManualSheetRow(
-                            manualId = ui.manualId,
-                            displayMs = manualDisplayMs,
-                            isLive = manualIsLive,
-                            isMeasuring = manualShowDots,
-                            isCurrent = ui.manualId != null && ui.manualId == ui.currentId,
-                            onSelect = { ui.manualId?.let { viewModel.selectEndpoint(it) } },
-                            onAdd = { viewModel.openManualDialog() },
-                            onEdit = { ui.manualId?.let { viewModel.openEditDialog(it) } },
-                            onDelete = { ui.manualId?.let { viewModel.deleteEndpoint(it) } }
-                        )
                     }
                 )
-            }
-        }
-    }
-
-    // Edit Endpoint dialog (ADD mode from "+ Manual endpoint", EDIT mode from row pencil)
-    if (ui.manualDialogOpen) {
-        val target = ui.editTargetId
-        var text by remember(target) { mutableStateOf(target ?: "") }
-        Dialog(onDismissRequest = { viewModel.closeManualDialog() }) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(24.dp))
-                    .background(Surface)
-                    .border(1.dp, SheetBorder, RoundedCornerShape(24.dp))
-                    .padding(24.dp)
-            ) {
-                Text(
-                    text = "Edit Endpoint",
-                    color = TextPrimary,
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "Endpoint အသစ်ထည့်ပါ (ဥပမာ - 162.159.192.20:500)",
-                    color = TextSecondary,
-                    fontSize = 14.sp,
-                    modifier = Modifier.padding(top = 12.dp)
-                )
-                OutlinedTextField(
-                    value = text,
-                    onValueChange = { text = it },
-                    label = { Text("Endpoint", color = TextMuted) },
-                    singleLine = true,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 16.dp)
-                )
-                Text(
-                    text = "မှတ်ချက် - Save လုပ်လိုက်ပါက Name ကိုလည်း Endpoint ရဲ့ IP အလိုအလျောက် ချိန်းပါမည်။",
-                    color = TextMuted,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(top = 12.dp)
-                )
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 20.dp),
-                    horizontalArrangement = Arrangement.End,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    TextButton(onClick = { viewModel.closeManualDialog() }) {
-                        Text("CANCEL", color = TextSecondary, fontWeight = FontWeight.SemiBold)
-                    }
-                    Spacer(Modifier.width(8.dp))
-                    TextButton(onClick = { viewModel.saveManualEndpoint(text) }) {
-                        Text("SAVE", color = Color(0xFFE5484D), fontWeight = FontWeight.SemiBold)
-                    }
-                }
             }
         }
     }
@@ -1181,8 +1135,7 @@ private fun Stat(value: String, unit: String?, label: String, dim: Boolean) {
 private fun FloatingEndpointSheet(
     onDismiss: () -> Unit,
     header: @Composable ColumnScope.() -> Unit,
-    rows: @Composable ColumnScope.() -> Unit,
-    footer: @Composable ColumnScope.() -> Unit
+    rows: @Composable ColumnScope.() -> Unit
 ) {
     val sheetShape = RoundedCornerShape(24.dp)
     val offsetY = remember { Animatable(0f) }
@@ -1253,13 +1206,6 @@ private fun FloatingEndpointSheet(
         Column(modifier = Modifier.padding(horizontal = 16.dp)) {
             rows()
         }
-        // Footer: manual endpoint row.
-        Column(
-            modifier = Modifier.padding(horizontal = 16.dp).padding(top = 4.dp, bottom = 10.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            footer()
-        }
     }
 }
 
@@ -1325,79 +1271,6 @@ private fun EndpointSheetRow(
                     Text(text = " ● LIVE", color = Teal, fontSize = 9.sp)
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun ManualSheetRow(
-    manualId: String?,
-    displayMs: Long?,
-    isLive: Boolean,
-    isMeasuring: Boolean,
-    isCurrent: Boolean,
-    onSelect: () -> Unit,
-    onAdd: () -> Unit,
-    onEdit: () -> Unit,
-    onDelete: () -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { if (manualId != null) onSelect() else onAdd() }
-            .padding(vertical = 10.dp, horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        if (manualId != null) {
-            Text(
-                text = manualId,
-                color = TextPrimary,
-                fontSize = 13.sp,
-                modifier = Modifier.weight(1f)
-            )
-            // Width grows for the ● LIVE tag; the manual row shares no
-            // column with the published cards, so nothing misaligns.
-            Box(modifier = Modifier.widthIn(min = 56.dp)) {
-                if (isMeasuring) {
-                    Text(text = "…", color = TextSecondary, fontSize = 12.sp)
-                } else if (displayMs != null) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = "${displayMs}ms",
-                            color = TextSecondary,
-                            fontSize = 12.sp
-                        )
-                        if (isLive) {
-                            Text(text = " ● LIVE", color = Teal, fontSize = 9.sp)
-                        }
-                    }
-                }
-            }
-            Box(modifier = Modifier.width(26.dp)) {
-                if (isCurrent) Text(text = "✓", color = Green, fontSize = 16.sp)
-            }
-            Icon(
-                imageVector = Icons.Filled.Edit,
-                contentDescription = "Edit endpoint",
-                tint = Teal,
-                modifier = Modifier
-                    .padding(start = 4.dp)
-                    .size(16.dp)
-                    .clickable { onEdit() }
-            )
-            Icon(
-                imageVector = Icons.Filled.Delete,
-                contentDescription = "Delete endpoint",
-                tint = TextMuted,
-                modifier = Modifier
-                    .padding(start = 8.dp)
-                    .size(16.dp)
-                    .clickable { onDelete() }
-            )
-        } else {
-            Text(text = "＋", color = Teal, fontSize = 17.sp)
-            Spacer(Modifier.width(12.dp))
-            Text(text = "Manual endpoint", color = TextSecondary, fontSize = 13.sp)
         }
     }
 }

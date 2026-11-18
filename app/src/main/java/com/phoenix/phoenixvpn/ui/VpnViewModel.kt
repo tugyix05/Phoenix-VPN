@@ -64,9 +64,6 @@ data class PhoenixUiState(
     val autoRun: Boolean = false,
     val newBestAvailable: Boolean = false,
     val sheetOpen: Boolean = false,
-    val manualDialogOpen: Boolean = false,
-    /** null = ADD mode; non-null = EDIT mode for this endpoint id. */
-    val editTargetId: String? = null,
     val aboutOpen: Boolean = false,
     val message: String? = null,
     val connectedAt: Long = 0L,
@@ -328,9 +325,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         _ui.update {
             it.copy(
                 autoRun = store.autoRun,
-                currentId = cur,
-                manualId = store.manualEndpoint,
-                manualMs = store.manualMs
+                currentId = cur
             )
         }
         manager.setAutoRun(store.autoRun)
@@ -421,7 +416,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             manager.walkCandidate.collect { cand ->
                 _ui.update {
                     when {
-                        cand != null -> it.copy(statusLine = "Connecting\u2026 ${cand.id}")
+                        cand != null -> it.copy(statusLine = "Connecting…")
                         it.statusLine?.startsWith("Connecting\u2026") == true -> it.copy(statusLine = null)
                         else -> it
                     }
@@ -581,28 +576,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                     null
                 }
                 refreshUiRows()
-                val manualNow = store.manualEndpoint
-                if (feedStart == null && manualNow != null &&
-                    store.currentEndpoint == manualNow
-                ) {
-                    // Last-connected IS manual: the manual choice gets
-                    // one verified 5s attempt (v1.64 — no more
-                    // fire-and-forget + birth wake on one endpoint).
-                    // On failure, fall to the published walk, skipping
-                    // manual; a stall while connected is handled by
-                    // failover instead.
-                    if (!connectTo(manualNow, conf)) {
-                        if (!connectWalk(
-                                conf, excludeId = manualNow,
-                                startId = publishedWalkList().firstOrNull()?.id
-                            )
-                        ) {
-                            walkExhausted = true
-                            VpnForegroundService.stopQuiet(app)
-                            message("No endpoint connected")
-                        }
-                    }
-                } else if (!connectWalk(conf, excludeId = null, startId = feedStart)) {
+                // v1.73: manual removed — the walk always runs the
+                // published list (parallel probe-first); no manual
+                // endpoint can be set or selected anymore.
+                if (!connectWalk(conf, excludeId = null, startId = feedStart)) {
                     // All attempts failed: quiet cleanup (no manual-off
                     // semantics — the user did NOT ask to stop).
                     walkExhausted = true
@@ -622,38 +599,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Explicit manual choice, v1.64: one verified 5s attempt (the
-     * pass-2 window). Returns true on a landed handshake. No more
-     * fire-and-forget + birth wake on one endpoint — on failure the
-     * caller falls back to the published walk, skipping manual.
-     * The caller owns all messaging on failure.
-     */
-    private suspend fun connectTo(endpointId: String, conf: String): Boolean {
-        val cfg = manager.swapEndpoint(conf, endpointId)
-        manager.setUserOverride(false)
-        store.currentEndpoint = endpointId
-        tunnelEndpointId = endpointId
-        refreshUiRows()
-        _ui.update { it.copy(currentMs = msFor(endpointId)) }
-        val ok = try {
-            manager.startTunnelAndAwaitHandshake(
-                manager.tunnelNameFor(endpointId), cfg, 5000L
-            )
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (_: Exception) {
-            false
-        }
-        if (ok) {
-            walkExhausted = false
-            manager.clearAutoWalkExhausted()
-        } else {
-            _ui.update { it.copy(statusLine = null) }
-        }
-        return ok
-    }
-
-    /**
      * v1.72 walk: thin UI wrapper over the manager's shared parallel
      * probe-first walk (same walk the auto path runs). The manager owns
      * candidates, attempts and the last-connected store; this wrapper
@@ -669,7 +614,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         startId: String?
     ): Boolean {
         val winner = manager.walkEndpoints(conf, startId, excludeId) { e ->
-            _ui.update { it.copy(statusLine = "Connecting\u2026 ${e.id}") }
+            _ui.update { it.copy(statusLine = "Connecting…") }
         }
         if (winner != null) {
             tunnelEndpointId = winner.id
@@ -737,8 +682,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             val walkStart = if (store.feedRestartPending) {
                 store.feedRestartPending = false
                 store.effectiveList().firstOrNull()?.id
-            } else if (cur == store.manualEndpoint) {
-                publishedWalkList().firstOrNull()?.id
             } else {
                 successorOf(cur)
             }
@@ -757,133 +700,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     fun openSheet() = _ui.update { it.copy(sheetOpen = true) }
     fun closeSheet() = _ui.update { it.copy(sheetOpen = false) }
-
-    /**
-     * v1.62: only the manual slot is selectable from the sheet.
-     * A published row tap closes the sheet only (HomeScreen), and
-     * any stray published id reaching here is treated the same —
-     * the walk decides published endpoints, never a sheet tap.
-     */
-    fun selectEndpoint(id: String) {
-        closeSheet()
-        if (id != store.manualEndpoint) return
-        store.currentEndpoint = id
-        store.explicitEndpoint = id
-        _ui.update { it.copy(newBestAvailable = false) }
-        val conf = store.baseConf
-        if (conf == null) {
-            // No conf yet — the full flow picks up the stored selection.
-            connectFlow()
-            return
-        }
-        if (id == _ui.value.currentId &&
-            vpnState.value.connectionState == TunnelConnectionState.CONNECTED
-        ) return
-        refreshUiRows()
-        if (vpnState.value.connectionState == TunnelConnectionState.CONNECTED ||
-            vpnState.value.connectionState == TunnelConnectionState.CONNECTING
-        ) {
-            // Switching manual while connected: one verified 5s attempt
-            // on the new manual (v1.64); on failure, the published walk,
-            // skipping manual — never a birth wake on one endpoint.
-            viewModelScope.launch {
-                try { manager.stopTunnel() } catch (_: Exception) {}
-                if (!connectTo(id, conf)) {
-                    if (!connectWalk(
-                            conf, excludeId = id,
-                            startId = publishedWalkList().firstOrNull()?.id
-                        )
-                    ) {
-                        walkExhausted = true
-                        VpnForegroundService.stopQuiet(app)
-                        message("No endpoint connected")
-                    }
-                }
-            }
-        } else {
-            _ui.update { it.copy(currentMs = msFor(id)) }
-        }
-    }
-
-    fun openManualDialog() = _ui.update { it.copy(manualDialogOpen = true, editTargetId = null) }
-    fun openEditDialog(id: String) = _ui.update { it.copy(manualDialogOpen = true, editTargetId = id) }
-    fun closeManualDialog() = _ui.update { it.copy(manualDialogOpen = false, editTargetId = null) }
-
-    fun saveManualEndpoint(raw: String) {
-        val v = raw.trim()
-        if (!isValidEndpoint(v)) {
-            message("Use host:port (e.g. 8.34.70.118:500)")
-            return
-        }
-        val target = _ui.value.editTargetId
-        if (target == null) {
-            // ADD mode — single manual slot. Auto-select: the user just typed it.
-            store.manualEndpoint = v
-            store.currentEndpoint = v
-            store.explicitEndpoint = v
-            store.manualMs = null
-            _ui.update { it.copy(manualId = v, manualMs = null) }
-            message("Manual endpoint saved — testing…")
-            testManualEndpoint(v)
-        } else if (target == _ui.value.manualId) {
-            // EDIT mode on the manual endpoint.
-            store.manualEndpoint = v
-            store.currentEndpoint = v
-            store.explicitEndpoint = v
-            store.manualMs = null
-            _ui.update { it.copy(manualId = v, manualMs = null) }
-            message("Manual endpoint updated — testing…")
-            testManualEndpoint(v)
-        } else {
-            // EDIT mode on an auto-fetched row — persisted display override.
-            store.editedEndpoints = store.editedEndpoints + (target to v)
-            message("Endpoint updated")
-        }
-        closeSheet()
-        closeManualDialog()
-        refreshUiRows()
-    }
-
-    /** Test a manual endpoint with a 5s handshake; saves ms or null. */
-    private fun testManualEndpoint(id: String) {
-        // Don't disrupt an active connection.
-        val st = vpnState.value.connectionState
-        if (st == TunnelConnectionState.CONNECTED || st == TunnelConnectionState.CONNECTING) {
-            message("Manual endpoint saved (test skipped — VPN active)")
-            return
-        }
-        val conf = store.baseConf
-        if (conf == null) {
-            message("Manual endpoint saved (no config — test skipped)")
-            return
-        }
-        viewModelScope.launch {
-            try {
-                val cfg = manager.swapEndpoint(conf, id)
-                val ok = manager.startTunnelAndAwaitHandshake("manual-test", cfg, 5000L)
-                // Pure handshake RTT (excludes tunnel setup), or null if
-                // the slow rx-path was used.
-                val ms = manager.lastHandshakeMs
-                try { manager.stopTunnel() } catch (_: Exception) {}
-                if (ok && ms != null) {
-                    store.manualMs = ms
-                    message("Manual endpoint: ${ms}ms ✓")
-                } else if (ok) {
-                    // Reachable via data path, but no pure handshake ms captured.
-                    store.manualMs = null
-                    message("Manual endpoint reachable ✓")
-                } else {
-                    store.manualMs = null
-                    message("Manual endpoint unreachable")
-                }
-            } catch (e: Exception) {
-                try { manager.stopTunnel() } catch (_: Exception) {}
-                store.manualMs = null
-                message("Manual endpoint test failed")
-            }
-            refreshUiRows()
-        }
-    }
 
     fun deleteEndpoint(id: String) {
         if (id == _ui.value.manualId) {
@@ -981,7 +797,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 !isTestTunnelName(st.activeTunnelName))
     }
 
-    /** Sheet row ids in display order: published top-3, then manual. */
+    /** Sheet row ids in display order: published top-3. */
     private fun sheetTargetIds(): List<String> {
         val deleted = store.deletedEndpoints
         val edited = store.editedEndpoints
@@ -989,8 +805,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             .filter { it.id !in deleted }
             .map { edited[it.id] ?: it.id }
             .take(3)
-        val manual = store.manualEndpoint
-        return if (manual != null) top3 + manual else top3
+        return top3
     }
 
     /**
@@ -1479,8 +1294,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * v1.62 sheet rows: exactly ONE published row — the
-     * current/last-connected endpoint — plus the manual slot
-     * (rendered separately by HomeScreen). If the stored current
+     * current/last-connected endpoint. If the stored current
      * id is the manual id, the published row falls back to the
      * walk list's #1 for display; if the stored id is no longer
      * in the list (new feed dropped it), the row still shows the
@@ -1506,7 +1320,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             connected -> stored
             else -> walkList.firstOrNull()?.id
         }
-        val manual = store.manualEndpoint
         val rows = rowId?.let { id ->
             listOf(
                 EndpointRow(
@@ -1522,9 +1335,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             it.copy(
                 rows = rows,
                 currentId = cur,
-                currentMs = msFor(cur),
-                manualId = manual,
-                manualMs = store.manualMs
+                currentMs = msFor(cur)
             )
         }
     }
