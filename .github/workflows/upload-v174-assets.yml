@@ -34,3 +34,4 @@ jobs:
           gh release upload v1.74-202611180554 release-artifacts/PhoenixVPN-v1.74.apk release-artifacts/PhoenixVPN-v1.74-checksum.sha256 --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: tugyix05/Phoenix-VPN
