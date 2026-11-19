@@ -19,6 +19,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.InetAddress
@@ -227,6 +228,67 @@ object UpdateService {
     }
 
     /**
+     * v1.76: version pre-check. Asks the Lovable route which version
+     * it serves (GET {proxyUrl}/version → {"version": "1.76"})
+     * BEFORE any APK bytes are downloaded. Returns true only when
+     * the route says it serves exactly info.version. ANY failure —
+     * network error, non-200, bad/missing JSON, blank version,
+     * mismatch — returns false, and download() then goes straight
+     * to GitHub. The pre-check itself never downloads the APK: it
+     * reads at most 4 KiB of the response body, uses checkClient
+     * timeouts, and is bound to the physical network like every
+     * update request. Never throws.
+     */
+    private suspend fun proxyServesExpected(
+        context: Context,
+        info: ReleaseInfo
+    ): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val client = boundClient(context, checkClient) ?: checkClient
+            val req = Request.Builder()
+                .url(info.proxyUrl.trimEnd('/') + "/version")
+                .header("User-Agent", "PhoenixVPN (Android update)")
+                .header("Cache-Control", "no-cache")
+                .get()
+                .build()
+            client.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    Log.i(TAG, "Update pre-check: route HTTP " + resp.code + " — going straight to GitHub")
+                    return@withContext false
+                }
+                val body = try {
+                    val stream = resp.body?.byteStream()
+                        ?: return@withContext false
+                    stream.use { input ->
+                        val buf = ByteArray(4096)
+                        var read = 0
+                        while (read < buf.size) {
+                            val n = input.read(buf, read, buf.size - read)
+                            if (n < 0) break
+                            read += n
+                        }
+                        String(buf, 0, read, Charsets.UTF_8)
+                    }
+                } catch (_: Exception) {
+                    return@withContext false
+                }
+                val served = try {
+                    JSONObject(body).optString("version", "").trim()
+                } catch (_: Exception) {
+                    ""
+                }
+                val normalized = served.removePrefix("v").substringBefore("-")
+                val match = normalized.isNotEmpty() && normalized == info.version
+                Log.i(TAG, "Update pre-check: route serves " + served + ", expected " + info.version + " — " + if (match) "using Lovable" else "going straight to GitHub")
+                match
+            }
+        } catch (e: Exception) {
+            Log.i(TAG, "Update pre-check: failed " + e.javaClass.simpleName + " — going straight to GitHub")
+            false
+        }
+    }
+
+    /**
      * v1.61: download with Lovable-first + GitHub fallback.
      * Attempt 1 is the existing Lovable route (same link as the
      * homepage button). It is accepted only when the APK's own
@@ -236,6 +298,16 @@ object UpdateService {
      * file. On any Lovable failure, or a version mismatch, attempt
      * 2 is the versioned GitHub URL, which is always the right
      * version. The version CHECK is unchanged (GitHub latest).
+     *
+     * v1.76: the Lovable attempt is now gated by a version
+     * pre-check (proxyServesExpected): the route is only used
+     * when it reports serving exactly the expected version. A
+     * stale, dead, or version-less route is skipped WITHOUT
+     * downloading anything, so the double download (full APK
+     * from Lovable, deleted, then full APK from GitHub) can no
+     * longer happen. The post-download version check stays as a
+     * safety net for the race where the route re-deploys between
+     * the pre-check and the download.
      */
     suspend fun download(
         context: Context,
@@ -243,15 +315,17 @@ object UpdateService {
         destDir: File,
         onProgress: (Int) -> Unit
     ): Result<File> = withContext(Dispatchers.IO) {
-        val proxy = attemptDownload(context, info.proxyUrl, true, info, destDir, onProgress)
-        if (proxy.isSuccess) {
-            val file = proxy.getOrNull()!!
-            val got = downloadedVersion(context, file)
-            if (got == info.version) return@withContext proxy
-            Log.i(TAG, "Update download: Lovable served $got, expected ${info.version} — falling back to GitHub")
-            file.delete()
-        } else {
-            Log.i(TAG, "Update download: Lovable failed — falling back to GitHub")
+        if (proxyServesExpected(context, info)) {
+            val proxy = attemptDownload(context, info.proxyUrl, true, info, destDir, onProgress)
+            if (proxy.isSuccess) {
+                val file = proxy.getOrNull()!!
+                val got = downloadedVersion(context, file)
+                if (got == info.version) return@withContext proxy
+                Log.i(TAG, "Update download: Lovable served $got after a matching pre-check, expected ${info.version} — falling back to GitHub")
+                file.delete()
+            } else {
+                Log.i(TAG, "Update download: Lovable failed after a matching pre-check — falling back to GitHub")
+            }
         }
         attemptDownload(context, info.apkUrl, false, info, destDir, onProgress)
     }
