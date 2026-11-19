@@ -26,14 +26,20 @@ data class EndpointInfo(
 data class FetchedEndpoints(
     /** updated_at from the file, epoch millis. 0 if unparseable. */
     val updatedAt: Long,
-    val endpoints: List<EndpointInfo>
+    val endpoints: List<EndpointInfo>,
+    /** v1.75: optional "generator_url" / "update_url" from the feed. Null when absent. */
+    val generatorUrl: String? = null,
+    val updateUrl: String? = null
 )
 
 /**
  * Fetches the published top-10 endpoint list.
  *
  * Schema: {"v":1,"updated_at":"<ISO8601>","isp":"MPT",
- *          "endpoints":[{"ip":..,"port":500,"ms":..,"jitter_ms":..}]}
+ *          "endpoints":[{"ip":..,"port":500,"ms":..,"jitter_ms":..}],
+ *          "generator_url":"https://…","update_url":"https://…"}
+ * The two URL fields are optional (v1.75): when present they are the
+ * remote-configurable links; when absent the app keeps its defaults.
  *
  * The file may 404 until the first publish — callers treat failure as
  * "keep cache / bundled", never as fatal.
@@ -157,7 +163,12 @@ object EndpointService {
             )
         }
         if (list.isEmpty()) throw IOException("empty endpoints array")
-        return FetchedEndpoints(updatedAt = updatedAt, endpoints = list)
+        return FetchedEndpoints(
+            updatedAt = updatedAt,
+            endpoints = list,
+            generatorUrl = o.optString("generator_url", "").trim().takeIf { it.isNotBlank() },
+            updateUrl = o.optString("update_url", "").trim().takeIf { it.isNotBlank() }
+        )
     }
 
     private fun parseIso8601(s: String): Long {

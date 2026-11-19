@@ -16,6 +16,7 @@ import com.phoenix.phoenixvpn.analytics.Analytics
 import com.phoenix.phoenixvpn.network.ConfigService
 import com.phoenix.phoenixvpn.network.EndpointInfo
 import com.phoenix.phoenixvpn.network.EndpointService
+import com.phoenix.phoenixvpn.network.LinkConfig
 import com.phoenix.phoenixvpn.network.UpdateService
 import java.io.File
 import com.phoenix.phoenixvpn.vpn.EndpointStore
@@ -482,7 +483,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
             viewModelScope.launch {
                 if (!hasValidatedInternet()) return@launch
                 try {
-                    val fetched = ConfigService.fetchWireGuardConfig().getOrNull()
+                    val fetched = ConfigService.fetchWireGuardConfig(LinkConfig.generatorUrl(app)).getOrNull()
                     if (fetched != null) {
                         store.baseConf = fetched.content
                     }
@@ -579,7 +580,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
                 var conf = store.baseConf
                 if (conf.isNullOrBlank()) {
                     setPhase(SetupPhase.FETCHING_CONFIG, "Fetching config…")
-                    conf = ConfigService.fetchWireGuardConfig()
+                    conf = ConfigService.fetchWireGuardConfig(LinkConfig.generatorUrl(app))
                         .getOrElse {
                             message("Config fetch failed — check connection")
                             return@launch
@@ -1285,6 +1286,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val isNew = f.updatedAt != oldUpdated ||
             f.endpoints.map { it.id } != oldIds
         store.saveFetched(f, now())
+        // v1.75: cache the feed's link values (no-op when the feed
+        // carries none — cached values stay, defaults stay).
+        LinkConfig.applyFeed(app, f.generatorUrl, f.updateUrl)
         refreshUpdatedAgo()
         if (isNew) {
             store.feedRestartPending = true

@@ -58,16 +58,21 @@ object UpdateService {
      * serves the CURRENT version, so a Lovable download is accepted
      * only when the APK's own versionName matches the expected
      * version; otherwise it falls back to the versioned GitHub URL.
+     *
+     * v1.75: the proxy URL is no longer a const — it comes from
+     * LinkConfig (override → feed → default). The pre-1.75 value
+     * lives on as LinkConfig.DEFAULT_UPDATE_URL.
      */
-    private const val LOVABLE_DOWNLOAD_URL =
-        "https://ipmh.lovable.app/api/public/apk/phoenix-vpn-v18"
-
     private const val TAG = "PhoenixUpdate"
 
-    data class ReleaseInfo(val tag: String, val version: String) {
+    data class ReleaseInfo(
+        val tag: String,
+        val version: String,
+        /** Effective update-download URL, resolved in fetchLatest. */
+        val proxyUrl: String = LinkConfig.DEFAULT_UPDATE_URL
+    ) {
         val apkUrl: String get() = "$DOWNLOAD_BASE/$tag/PhoenixVPN-v$version.apk"
         val apkName: String get() = "PhoenixVPN-v$version.apk"
-        val proxyUrl: String get() = LOVABLE_DOWNLOAD_URL
     }
 
     private val checkClient = OkHttpClient.Builder()
@@ -88,12 +93,13 @@ object UpdateService {
     /** The latest release published on GitHub. Never throws. */
     suspend fun fetchLatest(context: Context): Result<ReleaseInfo> =
         withContext(Dispatchers.IO) {
+            val proxyUrl = LinkConfig.updateUrl(context)
             val bound = boundClient(context, checkClient)
-            val r = attemptLatest(bound ?: checkClient)
-            if (r.isSuccess || bound == null) r else attemptLatest(checkClient)
+            val r = attemptLatest(bound ?: checkClient, proxyUrl)
+            if (r.isSuccess || bound == null) r else attemptLatest(checkClient, proxyUrl)
         }
 
-    private fun attemptLatest(client: OkHttpClient): Result<ReleaseInfo> {
+    private fun attemptLatest(client: OkHttpClient, proxyUrl: String): Result<ReleaseInfo> {
         return try {
             val req = Request.Builder()
                 .url(LATEST_URL)
@@ -117,7 +123,7 @@ object UpdateService {
                 if (version.isEmpty() || version == tag) {
                     return Result.failure(IOException("Bad tag: $tag"))
                 }
-                Result.success(ReleaseInfo(tag, version))
+                Result.success(ReleaseInfo(tag, version, proxyUrl))
             }
         } catch (e: Exception) {
             Result.failure(e)

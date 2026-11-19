@@ -6,7 +6,10 @@ import android.content.Context
 import android.content.Intent
 import android.os.PowerManager
 import android.os.SystemClock
+import com.phoenix.phoenixvpn.network.LinkConfig
 import com.phoenix.phoenixvpn.network.UpdateService
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -18,6 +21,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -734,9 +738,11 @@ private fun UpdateBanner(viewModel: VpnViewModel) {
 
 private data class Quad(val text: String, val color: Color, val dot: Color, val glow: Boolean)
 
+@OptIn(ExperimentalFoundationApi::class) // combinedClickable (v1.75 long-press)
 @Composable
 private fun AppBar() {
     var logOpen by remember { mutableStateOf(false) }
+    var linkEditorOpen by remember { mutableStateOf(false) }
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
@@ -755,11 +761,126 @@ private fun AppBar() {
             color = Teal,
             fontSize = 14.sp,
             fontWeight = FontWeight.SemiBold,
-            modifier = Modifier.clickable { logOpen = true }.padding(4.dp)
+            // v1.75: tap still opens the log dialog; long-press opens
+            // the link editor (generator + update URLs, this phone only).
+            modifier = Modifier.combinedClickable(
+                onClick = { logOpen = true },
+                onLongClick = { linkEditorOpen = true }
+            ).padding(4.dp)
         )
     }
     if (logOpen) {
         LogDialog(onDismiss = { logOpen = false })
+    }
+    if (linkEditorOpen) {
+        LinkEditorDialog(onDismiss = { linkEditorOpen = false })
+    }
+}
+
+/**
+ * Link editor (v1.75). Long-press on "Log" opens it. Two fields —
+ * the .conf generator URL and the update-download URL — prefilled
+ * with their current effective values. Saving stores a per-device
+ * override (this phone only); clearing the override returns to
+ * feed/default. Changing the links for ALL users is done in one
+ * place — endpoints.json — never from here.
+ */
+@Composable
+private fun LinkEditorDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var generator by remember { mutableStateOf(LinkConfig.generatorUrl(context)) }
+    var update by remember { mutableStateOf(LinkConfig.updateUrl(context)) }
+    var saved by remember { mutableStateOf(false) }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(20.dp))
+                .background(CardSurface)
+                .border(1.dp, SheetBorder, RoundedCornerShape(20.dp))
+                .padding(20.dp)
+        ) {
+            Text(
+                text = "Links",
+                color = TextPrimary,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = if (saved) "Saved on this phone only"
+                else "Paste a new link to change it on this phone. " +
+                    "To change it for all users, edit endpoints.json.",
+                color = TextSecondary,
+                fontSize = 11.sp,
+                lineHeight = 16.sp
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = generator,
+                onValueChange = { generator = it; saved = false },
+                label = { Text("Config generator URL", fontSize = 12.sp) },
+                singleLine = true,
+                colors = TextFieldDefaults.colors(
+                    focusedTextColor = TextPrimary,
+                    unfocusedTextColor = TextPrimary,
+                    focusedLabelColor = Teal,
+                    unfocusedLabelColor = TextSecondary,
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedContainerColor = Color.Transparent,
+                    cursorColor = Teal,
+                    focusedIndicatorColor = Teal,
+                    unfocusedIndicatorColor = SheetBorder
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedTextField(
+                value = update,
+                onValueChange = { update = it; saved = false },
+                label = { Text("Update download URL", fontSize = 12.sp) },
+                singleLine = true,
+                colors = TextFieldDefaults.colors(
+                    focusedTextColor = TextPrimary,
+                    unfocusedTextColor = TextPrimary,
+                    focusedLabelColor = Teal,
+                    unfocusedLabelColor = TextSecondary,
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedContainerColor = Color.Transparent,
+                    cursorColor = Teal,
+                    focusedIndicatorColor = Teal,
+                    unfocusedIndicatorColor = SheetBorder
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+            Spacer(Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                TextButton(onClick = {
+                    LinkConfig.clearOverride(context)
+                    generator = LinkConfig.generatorUrl(context)
+                    update = LinkConfig.updateUrl(context)
+                    saved = false
+                }) {
+                    Text("CLEAR OVERRIDE", color = TextSecondary, fontWeight = FontWeight.SemiBold)
+                }
+                TextButton(onClick = onDismiss) {
+                    Text("CLOSE", color = TextSecondary, fontWeight = FontWeight.SemiBold)
+                }
+                TextButton(onClick = {
+                    LinkConfig.setOverride(context, generator, update)
+                    generator = LinkConfig.generatorUrl(context)
+                    update = LinkConfig.updateUrl(context)
+                    saved = true
+                }) {
+                    Text("SAVE", color = Teal, fontWeight = FontWeight.SemiBold)
+                }
+            }
+        }
     }
 }
 

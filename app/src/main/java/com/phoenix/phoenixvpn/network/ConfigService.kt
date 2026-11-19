@@ -18,8 +18,9 @@ data class FetchedConfig(
 
 /** Fetches a fresh WireGuard .conf from the generator worker. */
 object ConfigService {
-    private const val GENERATE_URL = "https://pguard.val.run/"
-
+    // v1.75: the generator URL is no longer a const — it comes from
+    // LinkConfig (override → feed → default); see LinkConfig.kt.
+    // The pre-1.75 value lives on as LinkConfig.DEFAULT_GENERATOR_URL.
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
@@ -27,10 +28,10 @@ object ConfigService {
         .followRedirects(true)
         .build()
 
-    suspend fun fetchWireGuardConfig(): Result<FetchedConfig> = withContext(Dispatchers.IO) {
+    suspend fun fetchWireGuardConfig(generatorUrl: String): Result<FetchedConfig> = withContext(Dispatchers.IO) {
         try {
             val request = Request.Builder()
-                .url(GENERATE_URL)
+                .url(generatorUrl)
                 .header("User-Agent", "PhoenixVPN/1.0 (Android)")
                 .get()
                 .build()
