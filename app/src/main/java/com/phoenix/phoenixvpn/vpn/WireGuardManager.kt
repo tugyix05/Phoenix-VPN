@@ -43,6 +43,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import java.net.InetSocketAddress
+import java.net.Socket
 
 enum class TunnelConnectionState {
     DISCONNECTED,
@@ -67,6 +69,7 @@ data class VpnUiState(
 class WireGuardManager(private val context: Context) {
     private val scope = CoroutineScope(Dispatchers.Main + Job())
     private var statsJob: Job? = null
+    private var livePingJob: Job? = null
     private var autoTunnelJob: Job? = null
     private var periodicCheckJob: Job? = null
 
@@ -976,6 +979,7 @@ class WireGuardManager(private val context: Context) {
                 delay(3000)
             }
         }
+        startLivePing()
     }
 
     /** Newest peer handshake time (epoch ms) in [stats]; 0 when none landed. */
@@ -998,6 +1002,71 @@ class WireGuardManager(private val context: Context) {
     private fun stopStatsPolling() {
         statsJob?.cancel()
         statsJob = null
+        stopLivePing()
+    }
+
+    /**
+     * Live ping (v1.78): the first-handshake latency is ONE draw on MPT
+     * and can read far above the steady RTT (field 2026-11-22: probe
+     * 65ms, tunnel handshake 1.21s on the same flow) — so the PING
+     * number is re-measured live through the tunnel itself. A TCP
+     * connect to 1.1.1.1:443 goes through the VPN by default (the
+     * updater needs a network-bound client precisely to AVOID it), and
+     * is bound to the VPN network when one is found, so it can never
+     * silently measure the direct path. First run 500ms after the stats
+     * loop starts, then every 15s while connected; a failed probe keeps
+     * the last value. Started/stopped with the stats loop, so it only
+     * ever runs while connected. Deliberately NOT the probe RTT: the
+     * user wants the live session measured, not the probe's number.
+     */
+    private fun startLivePing() {
+        stopLivePing()
+        livePingJob = scope.launch(Dispatchers.IO) {
+            delay(LIVE_PING_FIRST_DELAY_MS)
+            while (isActive) {
+                measureLivePingMs()?.let { ms ->
+                    if (_vpnState.value.connectionState == TunnelConnectionState.CONNECTED) {
+                        _vpnState.update { it.copy(livePingMs = ms) }
+                    }
+                }
+                delay(LIVE_PING_INTERVAL_MS)
+            }
+        }
+    }
+
+    private fun stopLivePing() {
+        livePingJob?.cancel()
+        livePingJob = null
+    }
+
+    /** One TCP-connect RTT through the tunnel to 1.1.1.1:443, or null on failure/timeout. */
+    private fun measureLivePingMs(): Long? {
+        var socket: Socket? = null
+        return try {
+            val t0 = SystemClock.elapsedRealtime()
+            socket = Socket()
+            vpnNetwork()?.bindSocket(socket)
+            socket.connect(InetSocketAddress(LIVE_PING_HOST, LIVE_PING_PORT), LIVE_PING_TIMEOUT_MS)
+            SystemClock.elapsedRealtime() - t0
+        } catch (_: Exception) {
+            null
+        } finally {
+            try {
+                socket?.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /** The VPN network, if Android currently has one (mirror of hasLiveUsableNetwork). */
+    private fun vpnNetwork(): Network? {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? ConnectivityManager ?: return null
+        for (network in cm.allNetworks) {
+            val caps = cm.getNetworkCapabilities(network) ?: continue
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return network
+        }
+        return null
     }
 
     /** Wall-clock stamp of the current flow's UP (set by stats polling). */
@@ -1457,6 +1526,13 @@ class WireGuardManager(private val context: Context) {
          * the native level and the UI would sit at "connecting" forever.
          */
         private const val STUCK_WATCHDOG_MS = 30_000L
+
+        /** Live ping (v1.78): TCP connect through the tunnel, see startLivePing. */
+        private const val LIVE_PING_HOST = "1.1.1.1"
+        private const val LIVE_PING_PORT = 443
+        private const val LIVE_PING_INTERVAL_MS = 15_000L
+        private const val LIVE_PING_FIRST_DELAY_MS = 500L
+        private const val LIVE_PING_TIMEOUT_MS = 1_500
 
         @Volatile
         private var INSTANCE: WireGuardManager? = null
