@@ -572,11 +572,14 @@ class WireGuardManager(private val context: Context) {
     /**
      * v1.72 parallel probe-first walk (first-wins, shared by manual and
      * auto — replaces the v1.64 two-speed sequential walk): one probe
-     * round fires a raw-UDP handshake initiation at EVERY candidate in
-     * parallel (fresh socket per endpoint = fresh flow/draw each round),
-     * and the first response wins. The winner then gets ONE real tunnel
-     * attempt ([startTunnelAndAwaitHandshake], 5s); if that fails, the
-     * next responder (in response order) is tried. If a round finds no
+     * round fires raw-UDP handshake initiations at EVERY candidate in
+     * parallel (v1.77 R1: 2 fresh sockets/flows per endpoint = 2 draws
+     * each round), and the first response wins. The winner then gets ONE
+     * real tunnel attempt ([startTunnelAndAwaitHandshake], 5s) — v1.77
+     * R2: the tunnel binds the winning probe flow's local port
+     * (ListenPort), so the proven-live flow becomes the tunnel's flow
+     * instead of a fresh ephemeral draw. If that fails, the next
+     * responder (in response order) is tried. If a round finds no
      * responder within [PROBE_ROUND_TIMEOUT_MS], ALL candidates are
      * re-rolled with fresh sockets. The walk gives up after
      * [MAX_PROBE_ROUNDS] rounds with no winner and returns null
@@ -620,17 +623,32 @@ class WireGuardManager(private val context: Context) {
         // v1.74: publish walk-active BEFORE the probe loop (not on the
         // early returns above, so an empty list never flashes it).
         _walkActive.value = true
+        // v1.77 R7: NAT mapping diagnostic — fire-and-forget, never
+        // blocks the walk (two STUN binding requests, logs only).
+        scope.launch { StunMapper.probeAndLog() }
         try {
             repeat(MAX_PROBE_ROUNDS) { round ->
                 currentCoroutineContext().ensureActive()
                 val responders = prober.probeRound(
                     candidates, PROBE_ROUND_TIMEOUT_MS, PROBE_RESPONDER_GRACE_MS
                 )
-                for (winner in responders) {
+                for (result in responders) {
+                    val winner = result.endpoint
                     currentCoroutineContext().ensureActive()
                     onCandidate?.invoke(winner)
                     _walkCandidate.value = winner
-                    val cfg = swapEndpoint(conf, winner.id)
+                    // v1.77 R2: the tunnel binds the WINNING probe flow's
+                    // local port (ListenPort) instead of a fresh ephemeral
+                    // one — the flow the probe just proved live becomes
+                    // the tunnel's flow. The probe socket is already
+                    // closed (probeRound's finally); the gap to the bind
+                    // is the 500ms DOWN/UP settle, far inside the CGNAT
+                    // mapping lifetime. If the port is taken meanwhile,
+                    // the bind fails cleanly and the next responder is
+                    // tried — same as any other attempt failure.
+                    val cfg = setListenPort(swapEndpoint(conf, winner.id), result.localPort)
+                    Log.i(TAG, "R2: winner ${winner.id} probe port ${result.localPort} " +
+                        "rtt ${result.rttMs}ms -> ListenPort=${result.localPort}")
                     val ok = try {
                         startTunnelAndAwaitHandshake(
                             tunnelNameFor(winner.id), cfg, WALK_TIMEOUT_MS
@@ -641,6 +659,8 @@ class WireGuardManager(private val context: Context) {
                         false
                     }
                     if (ok) {
+                        Log.i(TAG, "R2: port ${result.localPort} handshake OK " +
+                            "(${lastHandshakeMs}ms) — winner flow became the tunnel")
                         endpointStore.currentEndpoint = winner.id
                         if (endpointStore.explicitEndpoint != null &&
                             endpointStore.explicitEndpoint != endpointStore.manualEndpoint
@@ -649,6 +669,8 @@ class WireGuardManager(private val context: Context) {
                         }
                         return winner
                     }
+                    Log.i(TAG, "R2: port ${result.localPort} tunnel attempt failed " +
+                        "— try the next responder in response order.")
                     // Tunnel start failed for this responder (fresh draw)
                     // — try the next responder in response order.
                 }
@@ -773,6 +795,33 @@ class WireGuardManager(private val context: Context) {
             Regex("(?im)^\\s*Endpoint\\s*=.*"),
             "Endpoint = $endpoint"
         )
+    }
+
+    /**
+     * v1.77 R2: set (or replace) the ListenPort line in the [Interface]
+     * section to [port] — the winning probe flow's local port, so the
+     * tunnel binds the flow the probe just proved live. Mechanism
+     * (verified against the stock stack, no backend fork): the stock
+     * wireguard-android Config parser reads `ListenPort` into
+     * Interface.listenPort, GoBackend serializes it as UAPI
+     * `listen_port=N`, and wireguard-go's UAPI handler sets
+     * device.net.port = N and rebinds on exactly that port
+     * (BindUpdate → bind.Open(port)). A port outside 1..65535, or a
+     * conf with no [Interface] section, returns the conf unchanged —
+     * the attempt then proceeds exactly as v1.76 did (ephemeral port),
+     * so a bad port can never break a connect. A port taken between
+     * probe-close and tunnel-bind fails the attempt cleanly (bind
+     * error → next responder), same as any other attempt failure.
+     */
+    fun setListenPort(confText: String, port: Int): String {
+        if (port !in 1..65535) return confText
+        val existing = Regex("(?im)^\\s*ListenPort\\s*=.*")
+        if (existing.containsMatchIn(confText)) {
+            return existing.replaceFirst(confText) { "ListenPort = $port" }
+        }
+        val interfaceHeader = Regex("(?im)^\\[Interface\\]\\s*$")
+        if (!interfaceHeader.containsMatchIn(confText)) return confText
+        return interfaceHeader.replaceFirst(confText) { "[Interface]\nListenPort = $port" }
     }
 
     /**
@@ -1378,15 +1427,17 @@ class WireGuardManager(private val context: Context) {
          */
         private const val DOWN_UP_SETTLE_MS = 500L
         /**
-         * v1.72 parallel walk timeouts: each responder's tunnel attempt
-         * keeps the full 5s window (a proven responder deserves the
-         * same chance a pass-2 candidate had); the probe round waits
-         * 2s for the first response plus a 300ms grace for extra
-         * responders, and re-rolls up to 3 empty rounds before the
-         * walk gives up (exhaustion, never an endpoint-death verdict).
+         * v1.72 parallel walk timeouts, v1.77 R4: each responder's tunnel
+         * attempt keeps the full 5s window (a proven responder deserves
+         * the same chance a pass-2 candidate had); the probe round waits
+         * 800ms for the first response (v1.76: 2s — live answers land
+         * well under 1s, dead flows never answer in 5s, so the extra
+         * 1.2s bought nothing) plus a 300ms grace for extra responders,
+         * and re-rolls up to 3 empty rounds before the walk gives up
+         * (exhaustion, never an endpoint-death verdict).
          */
         private const val WALK_TIMEOUT_MS = 5_000L
-        private const val PROBE_ROUND_TIMEOUT_MS = 2_000L
+        private const val PROBE_ROUND_TIMEOUT_MS = 800L
         private const val PROBE_RESPONDER_GRACE_MS = 300L
         private const val MAX_PROBE_ROUNDS = 3
         /**

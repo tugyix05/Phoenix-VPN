@@ -13,6 +13,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -64,36 +65,62 @@ import org.bouncycastle.crypto.params.X25519PublicKeyParameters
 class WgProber {
 
     /**
-     * One probe round: fire a fresh-socket initiation at EVERY candidate
-     * in parallel (fresh socket = fresh flow/draw per endpoint) and
-     * collect responders in ARRIVAL order. Waits up to [timeoutMs] for
+     * One probe flow's result: the endpoint that answered, the local
+     * UDP port the winning socket used (v1.77 R2 — the walk reuses it
+     * as the tunnel's ListenPort), and the handshake-response RTT.
+     */
+    data class ProbeResult(
+        val endpoint: EndpointInfo,
+        val localPort: Int,
+        val rttMs: Long
+    )
+
+    /**
+     * One probe round: fire [FLOWS_PER_ENDPOINT] fresh-socket
+     * initiations at EVERY candidate in parallel (v1.77 R1 — each
+     * socket is its own flow/draw, so an endpoint gets 2 draws per
+     * round instead of 1) and collect responders in ARRIVAL order,
+     * first result per endpoint only. Waits up to [timeoutMs] for
      * the first response, then [graceMs] more for additional responders
      * (the walk tries them in this order if the winner's tunnel start
      * fails). Returns empty when nothing responded. Never throws for
      * per-endpoint failures — a socket that fails to bind just skips
-     * that endpoint for the round. Cancellation closes every live
+     * that flow for the round. Cancellation closes every live
      * socket at once, so a blocked receive aborts promptly.
      */
     suspend fun probeRound(
         candidates: List<EndpointInfo>,
         timeoutMs: Long,
         graceMs: Long
-    ): List<EndpointInfo> {
+    ): List<ProbeResult> {
         if (candidates.isEmpty()) return emptyList()
         val tracker = SocketTracker()
-        val found = Channel<EndpointInfo>(Channel.UNLIMITED)
+        val found = Channel<ProbeResult>(Channel.UNLIMITED)
+        // v1.77 R7: per-round flow census — the measurement that makes
+        // later tuning data instead of guesses (dead-rate per endpoint
+        // is visible in logcat, one line per flow).
+        val flowsSent = AtomicInteger(0)
+        val flowsAnswered = AtomicInteger(0)
+        val flowsTimedOut = AtomicInteger(0)
+        val flowsCookie = AtomicInteger(0)
+        val flowsFailed = AtomicInteger(0)
         return try {
             coroutineScope {
-                val jobs = candidates.map { e ->
-                    async(Dispatchers.IO) {
-                        try {
-                            probeOne(e, timeoutMs, tracker)?.let { found.trySend(it) }
-                        } catch (_: Exception) {
-                            // Per-endpoint failure: skip for this round.
+                val jobs = candidates.flatMap { e ->
+                    (1..FLOWS_PER_ENDPOINT).map { flow ->
+                        async(Dispatchers.IO) {
+                            try {
+                                probeOne(e, flow, timeoutMs, tracker, flowsSent,
+                                    flowsAnswered, flowsTimedOut, flowsCookie,
+                                    flowsFailed)?.let { found.trySend(it) }
+                            } catch (_: Exception) {
+                                // Per-flow failure: skip for this round.
+                            }
                         }
                     }
                 }
-                val responders = mutableListOf<EndpointInfo>()
+                val responders = mutableListOf<ProbeResult>()
+                val seen = mutableSetOf<String>()
                 val roundEnd = SystemClock.elapsedRealtime() + timeoutMs
                 var graceEnd = -1L
                 try {
@@ -103,9 +130,11 @@ class WgProber {
                             // Everything finished: drain stragglers, stop.
                             while (true) {
                                 val r = found.tryReceive().getOrNull() ?: break
-                                responders += r
-                                if (graceEnd < 0) {
-                                    graceEnd = SystemClock.elapsedRealtime() + graceMs
+                                if (seen.add(r.endpoint.id)) {
+                                    responders += r
+                                    if (graceEnd < 0) {
+                                        graceEnd = SystemClock.elapsedRealtime() + graceMs
+                                    }
                                 }
                             }
                             break
@@ -114,9 +143,11 @@ class WgProber {
                         val wait = limit - SystemClock.elapsedRealtime()
                         if (wait <= 0) break
                         val next = withTimeoutOrNull(wait) { found.receive() } ?: break
-                        responders += next
-                        if (graceEnd < 0) {
-                            graceEnd = SystemClock.elapsedRealtime() + graceMs
+                        if (seen.add(next.endpoint.id)) {
+                            responders += next
+                            if (graceEnd < 0) {
+                                graceEnd = SystemClock.elapsedRealtime() + graceMs
+                            }
                         }
                         if (responders.size == candidates.size) break
                     }
@@ -127,7 +158,10 @@ class WgProber {
                 Log.i(
                     TAG,
                     "probe round: ${responders.size}/${candidates.size} responders " +
-                        responders.joinToString(",") { it.id }
+                        responders.joinToString(",") { "${it.endpoint.id}@${it.localPort}:${it.rttMs}ms" } +
+                        " | flows sent=${flowsSent.get()} answered=${flowsAnswered.get()} " +
+                        "timeout=${flowsTimedOut.get()} cookie=${flowsCookie.get()} " +
+                        "failed=${flowsFailed.get()}"
                 )
                 responders
             }
@@ -137,58 +171,93 @@ class WgProber {
     }
 
     /**
-     * One probe: fresh socket, one initiation, wait for a type-2 reply.
-     * Returns the endpoint on a landed handshake response, null on
-     * timeout / bind failure / any error. The socket is always closed.
+     * One probe flow: fresh socket, one initiation, wait for a type-2
+     * reply. Returns the [ProbeResult] on a landed handshake response,
+     * null on timeout / bind failure / any error. The socket is always
+     * closed (the walk reuses only its local PORT, via ListenPort —
+     * the socket itself is gone by the time the tunnel starts).
+     * Every outcome is logged at INFO (v1.77 R7 — R8 strips Log.d in
+     * release, so debug-level flow lines would never reach the field).
      */
     private suspend fun probeOne(
         endpoint: EndpointInfo,
+        flow: Int,
         timeoutMs: Long,
-        tracker: SocketTracker
-    ): EndpointInfo? {
+        tracker: SocketTracker,
+        flowsSent: AtomicInteger,
+        flowsAnswered: AtomicInteger,
+        flowsTimedOut: AtomicInteger,
+        flowsCookie: AtomicInteger,
+        flowsFailed: AtomicInteger
+    ): ProbeResult? {
         currentCoroutineContext().ensureActive()
         val address = try {
             InetAddress.getByName(endpoint.ip)
         } catch (_: Exception) {
+            flowsFailed.incrementAndGet()
             return null
         }
         val packet = try {
             buildInitiation()
         } catch (_: Exception) {
+            flowsFailed.incrementAndGet()
             return null
         }
         var socket: DatagramSocket? = null
         try {
             socket = DatagramSocket()
             tracker.register(socket)
+            val localPort = socket.localPort
             socket.soTimeout = timeoutMs.toInt()
             socket.connect(address, endpoint.port)
+            val sentAt = SystemClock.elapsedRealtime()
             socket.send(DatagramPacket(packet, packet.size))
-            val deadline = SystemClock.elapsedRealtime() + timeoutMs
+            flowsSent.incrementAndGet()
+            val deadline = sentAt + timeoutMs
             val recvBuf = ByteArray(2048)
+            var cookieLogged = false
             while (true) {
                 currentCoroutineContext().ensureActive()
                 val remaining = deadline - SystemClock.elapsedRealtime()
-                if (remaining <= 0) return null
+                if (remaining <= 0) {
+                    flowsTimedOut.incrementAndGet()
+                    Log.i(TAG, "flow ep=${endpoint.id} f=$flow port=$localPort timeout ${timeoutMs}ms")
+                    return null
+                }
                 socket.soTimeout = remaining.coerceAtMost(timeoutMs).toInt()
                 val recvPacket = DatagramPacket(recvBuf, recvBuf.size)
                 try {
                     socket.receive(recvPacket)
                 } catch (_: SocketTimeoutException) {
+                    flowsTimedOut.incrementAndGet()
+                    Log.i(TAG, "flow ep=${endpoint.id} f=$flow port=$localPort timeout ${timeoutMs}ms")
                     return null
                 }
                 val n = recvPacket.length
-                if (n == 92 && recvBuf[0] == 2.toByte()) return endpoint
+                if (n == 92 && recvBuf[0] == 2.toByte()) {
+                    val rtt = SystemClock.elapsedRealtime() - sentAt
+                    flowsAnswered.incrementAndGet()
+                    Log.i(TAG, "flow ep=${endpoint.id} f=$flow port=$localPort OK ${rtt}ms")
+                    return ProbeResult(endpoint, localPort, rtt)
+                }
                 if (n >= 1 && recvBuf[0] == 3.toByte()) {
                     // Cookie reply: endpoint alive but loaded (wants a
                     // mac2 retry, not implemented) — keep waiting.
+                    if (!cookieLogged) {
+                        cookieLogged = true
+                        flowsCookie.incrementAndGet()
+                        Log.i(TAG, "flow ep=${endpoint.id} f=$flow port=$localPort cookie (alive, loaded)")
+                    }
                     continue
                 }
                 // Anything else: ignore, keep waiting for a real reply.
             }
         } catch (_: SocketException) {
+            flowsFailed.incrementAndGet()
+            Log.i(TAG, "flow ep=${endpoint.id} f=$flow bind failed")
             return null
         } catch (_: Exception) {
+            flowsFailed.incrementAndGet()
             return null
         } finally {
             socket?.let {
@@ -344,6 +413,15 @@ class WgProber {
 
     companion object {
         private const val TAG = "PhoenixWgProber"
+
+        /**
+         * v1.77 R1: flows (fresh sockets = fresh draws) raced per
+         * endpoint per round. 1 draw = 50% per endpoint at p=0.5;
+         * 2 draws = 75%; 3 draws = 87.5% but 60 sockets at 20
+         * candidates — 2 is the measured-tradeoff point (R7 logs
+         * will show whether 3 is ever needed).
+         */
+        private const val FLOWS_PER_ENDPOINT = 2
 
         /** Cloudflare WARP peer public key (public, same for all WARP endpoints). */
         private const val PEER_PUBLIC_B64 = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
