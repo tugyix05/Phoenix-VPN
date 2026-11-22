@@ -817,11 +817,14 @@ class WireGuardManager(private val context: Context) {
         if (port !in 1..65535) return confText
         val existing = Regex("(?im)^\\s*ListenPort\\s*=.*")
         if (existing.containsMatchIn(confText)) {
-            return existing.replaceFirst(confText) { _ -> "ListenPort = $port" }
+            // Plain-String overload (same pattern as swapEndpoint): the
+            // replacement holds only the port digits, so no $ or \ can
+            // be misread as a group reference.
+            return existing.replaceFirst(confText, "ListenPort = $port")
         }
         val interfaceHeader = Regex("(?im)^\\[Interface\\]\\s*$")
         if (!interfaceHeader.containsMatchIn(confText)) return confText
-        return interfaceHeader.replaceFirst(confText) { _ -> "[Interface]\nListenPort = $port" }
+        return interfaceHeader.replaceFirst(confText, "[Interface]\nListenPort = $port")
     }
 
     /**
