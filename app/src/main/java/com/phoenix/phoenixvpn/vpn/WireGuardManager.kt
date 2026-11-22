@@ -817,11 +817,11 @@ class WireGuardManager(private val context: Context) {
         if (port !in 1..65535) return confText
         val existing = Regex("(?im)^\\s*ListenPort\\s*=.*")
         if (existing.containsMatchIn(confText)) {
-            return existing.replaceFirst(confText) { "ListenPort = $port" }
+            return existing.replaceFirst(confText) { _ -> "ListenPort = $port" }
         }
         val interfaceHeader = Regex("(?im)^\\[Interface\\]\\s*$")
         if (!interfaceHeader.containsMatchIn(confText)) return confText
-        return interfaceHeader.replaceFirst(confText) { "[Interface]\nListenPort = $port" }
+        return interfaceHeader.replaceFirst(confText) { _ -> "[Interface]\nListenPort = $port" }
     }
 
     /**
